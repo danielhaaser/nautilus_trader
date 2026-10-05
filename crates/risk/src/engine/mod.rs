@@ -2479,7 +2479,7 @@ impl AccountRisk<'_> {
         };
 
         margin
-            .calculate_initial_margin(self.instrument, quantity, price, None)
+            .calculate_initial_margin_for_side(self.instrument, order.order_side(), quantity, price, None)
             .map_err(|e| {
                 self.check.reject(
                     self.engine,

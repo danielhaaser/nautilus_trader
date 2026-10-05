@@ -281,58 +281,58 @@ impl AccountsManager {
 
             let margin_maint = match instrument {
                 InstrumentAny::Betting(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::BinaryOption(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Cfd(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Commodity(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuture(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuturesSpread(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOption(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOptionSpread(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoPerpetual(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CurrencyPair(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Equity(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesContract(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesSpread(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::IndexInstrument(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionContract(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionSpread(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::PerpetualContract(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
                 InstrumentAny::TokenizedAsset(i) => account
-                    .calculate_maintenance_margin(i, quantity, price, None)
+                    .calculate_maintenance_margin_for_side(i, net_entry, quantity, price, None)
                     .ok()?,
             };
 
@@ -704,61 +704,62 @@ impl AccountsManager {
             } else {
                 order.trigger_price()
             };
+            let (side, quantity, price) = (order.order_side(), order.leaves_qty(), price?);
 
             let margin_init = match instrument {
                 InstrumentAny::Betting(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::BinaryOption(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Cfd(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Commodity(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuture(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoFuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOption(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoOptionSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CryptoPerpetual(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::CurrencyPair(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::Equity(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::FuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::IndexInstrument(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::OptionSpread(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::PerpetualContract(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
                 InstrumentAny::TokenizedAsset(i) => account
-                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
+                    .calculate_initial_margin_for_side(i, side, quantity, price, None)
                     .ok()?,
             };
 
