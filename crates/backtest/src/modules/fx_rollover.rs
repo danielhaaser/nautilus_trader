@@ -809,7 +809,6 @@ impl SimulationModule for FXRolloverInterestModule {
 
 #[cfg(test)]
 mod tests {
-    use indexmap::IndexMap;
     use jiff::tz::Offset;
     use nautilus_common::cache::Cache;
     use nautilus_model::identifiers::{InstrumentId, Venue};
@@ -1065,7 +1064,7 @@ mod tests {
         );
 
         let instruments = AHashMap::new();
-        let matching_engines = IndexMap::new();
+        let matching_engines = crate::exchange::MatchingEngines::default();
         let cache = Cache::default();
         let ctx = ExchangeContext {
             venue: Venue::new("SIM"),
@@ -1195,7 +1194,7 @@ mod tests {
             ])
         );
         let instruments = AHashMap::new();
-        let matching_engines = IndexMap::new();
+        let matching_engines = crate::exchange::MatchingEngines::default();
         let cache = Cache::default();
         let ctx = ExchangeContext {
             venue: Venue::new("SIM"),

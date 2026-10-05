@@ -2576,6 +2576,19 @@ impl OrderMatchingEngine {
         self.expiration_processed
     }
 
+    /// Puts a newly built engine into the state a settled engine of the same instrument reached:
+    /// expiration processed and `market_status`.
+    ///
+    /// For an exchange that removed a settled engine and is rebuilding it because something
+    /// addressed its instrument again. A settled engine holds no orders, so what remains of its
+    /// state for any later command or market data is these flags and its raw ID.
+    pub fn restore_settled(&mut self, market_status: MarketStatus) {
+        self.expiration_processed = true;
+        self.pending_resolution = false;
+        self.instrument_close = None;
+        self.market_status = market_status;
+    }
+
     /// Returns whether a further `process_instrument_expiration` call is a no-op: expiration is
     /// processed, or option settlement failed terminally (until `reset`).
     #[must_use]

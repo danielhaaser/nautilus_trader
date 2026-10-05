@@ -26,10 +26,8 @@ use std::{
 use ahash::AHashMap;
 pub use cfd_swap::{CfdSwapModule, CfdSwapRate};
 pub use fx_rollover::FXRolloverInterestModule;
-use indexmap::IndexMap;
 use nautilus_common::cache::Cache;
 use nautilus_core::UnixNanos;
-use nautilus_execution::matching_engine::OrderMatchingEngine;
 use nautilus_model::{
     data::Data,
     identifiers::{InstrumentId, Venue},
@@ -47,7 +45,7 @@ pub struct ExchangeContext<'a> {
     /// All instruments registered on the exchange.
     pub instruments: &'a AHashMap<InstrumentId, InstrumentAny>,
     /// All matching engines, providing order book access.
-    pub matching_engines: &'a IndexMap<InstrumentId, OrderMatchingEngine>,
+    pub matching_engines: &'a crate::exchange::MatchingEngines,
     /// Read-only cache access for querying positions and other state.
     pub cache: &'a Cache,
 }
