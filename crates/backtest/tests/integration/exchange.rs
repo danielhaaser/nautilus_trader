@@ -56,13 +56,13 @@ use nautilus_execution::models::{
 use nautilus_model::{
     accounts::{Account, AccountAny, CashAccount, MarginAccount},
     data::{
-        Bar, BarType, BookOrder, Data, FundingRateUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
+        Bar, BarType, BookOrder, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
     },
     enums::{
         AccountType, AggressorSide, AssetClass, BookAction, BookType, ContingencyType,
-        LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind, OrderSide,
-        OrderStatus, OrderType, PositionAdjustmentType,
+        InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
+        OrderSide, OrderStatus, OrderType, PositionAdjustmentType,
     },
     events::{
         AccountState, FundingSettlement, OrderEventAny, OrderFilled, PositionEvent,
@@ -5103,4 +5103,153 @@ fn test_contingent_fill_preserves_later_queued_submit(
         cache.borrow().order(&child_id).unwrap().quantity(),
         Quantity::from("1.000")
     );
+}
+
+/// Runs a binary option to settlement (expiry, then its close), optionally releases settled
+/// engines, then submits an order for it; returns how many engines were released, whether the
+/// engine is still reachable, and the order events the exchange emitted.
+fn settle_then_submit(release: bool) -> (usize, bool, Vec<String>) {
+    let binary = nautilus_model::instruments::stubs::binary_option();
+    let instrument = InstrumentAny::BinaryOption(binary);
+    let instrument_id = instrument.id();
+    let expiration_ns = instrument.expiration_ns().unwrap();
+    let exchange = get_exchange(
+        instrument_id.venue,
+        AccountType::Cash,
+        BookType::L1_MBP,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
+    msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+
+    exchange.borrow().set_clock_time(expiration_ns);
+    exchange
+        .borrow_mut()
+        .process_instrument_expirations(expiration_ns);
+    exchange
+        .borrow_mut()
+        .process_instrument_close(InstrumentClose::new(
+            instrument_id,
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            expiration_ns,
+            expiration_ns,
+        ))
+        .unwrap();
+    // The expiration instant after the close is what marks the engine settled for the sweep.
+    exchange
+        .borrow_mut()
+        .process_instrument_expirations(expiration_ns);
+
+    let released = if release {
+        exchange.borrow_mut().remove_settled_instruments()
+    } else {
+        0
+    };
+    let reachable = exchange
+        .borrow()
+        .get_matching_engine(&instrument_id)
+        .is_some();
+    assert!(
+        exchange
+            .borrow()
+            .instrument_ids()
+            .any(|id| *id == instrument_id)
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_id)
+        .client_order_id(ClientOrderId::new("O-AFTER-SETTLE"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.00"))
+        .price(Price::from("0.500"))
+        .build();
+    let command = TradingCommand::SubmitOrder(SubmitOrder::new(
+        TraderId::test_default(),
+        None,
+        StrategyId::test_default(),
+        instrument_id,
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::default(),
+        expiration_ns,
+        None,
+    ));
+    let account_id = AccountId::test_default();
+    exchange
+        .borrow()
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    exchange
+        .borrow()
+        .cache()
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    exchange.borrow_mut().send(command);
+    exchange.borrow_mut().process(expiration_ns);
+
+    let events = saving_handler
+        .get_messages()
+        .iter()
+        .map(|event| match event {
+            OrderEventAny::Rejected(rejected) => {
+                format!("rejected {} {}", rejected.client_order_id, rejected.reason)
+            }
+            other => format!("{other:?}"),
+        })
+        .collect();
+    (released, reachable, events)
+}
+
+/// A settled binary option's matching engine is released, and an order sent to it afterwards is
+/// answered exactly as the settled engine answered it (the engine is rebuilt in that state).
+#[rstest]
+fn test_remove_settled_instruments_releases_engine_and_answers_identically() {
+    let (kept_released, kept_reachable, kept_events) = settle_then_submit(false);
+    let (released, reachable_after, released_events) = settle_then_submit(true);
+
+    assert_eq!(kept_released, 0);
+    assert!(kept_reachable);
+    assert_eq!(released, 1);
+    assert!(!reachable_after);
+    assert!(
+        kept_events
+            .iter()
+            .any(|event| event.starts_with("rejected O-AFTER-SETTLE")),
+        "{kept_events:?}"
+    );
+    assert_eq!(released_events, kept_events);
+}
+
+/// An engine whose instrument has no expiration is never released.
+#[rstest]
+fn test_remove_settled_instruments_keeps_unsettled_engines(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let exchange = get_exchange(
+        Venue::new("BINANCE"),
+        AccountType::Margin,
+        BookType::L1_MBP,
+        None,
+    );
+    exchange
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+    exchange
+        .borrow_mut()
+        .process_instrument_expirations(UnixNanos::from(u64::MAX - 1));
+
+    assert_eq!(exchange.borrow_mut().remove_settled_instruments(), 0);
+    assert_eq!(exchange.borrow().get_matching_engines().len(), 1);
 }
