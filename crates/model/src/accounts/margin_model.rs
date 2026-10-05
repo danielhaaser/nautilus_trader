@@ -20,6 +20,7 @@ use std::{fmt::Debug, sync::Arc};
 use rust_decimal::Decimal;
 
 use crate::{
+    enums::OrderSide,
     instruments::Instrument,
     types::{Money, Price, Quantity},
 };
@@ -57,6 +58,56 @@ pub trait MarginModel: Send + Sync {
         leverage: Decimal,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money>;
+
+    /// Calculates the initial (order) margin requirement for an order on `side`.
+    ///
+    /// The engine calls this rather than [`Self::calculate_initial_margin`], so a model whose
+    /// requirement depends on the side (a venue where a buyer and a writer post different
+    /// collateral) can tell them apart. The default ignores the side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if margin cannot be computed (e.g. invalid instrument).
+    fn calculate_initial_margin_for_side(
+        &self,
+        instrument: &dyn Instrument,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let _ = side;
+        self.calculate_initial_margin(instrument, quantity, price, leverage, use_quote_for_inverse)
+    }
+
+    /// Calculates the maintenance (position) margin requirement for a net position whose entry
+    /// side is `side` (`Buy` for a long, `Sell` for a short).
+    ///
+    /// The engine calls this rather than [`Self::calculate_maintenance_margin`]. The default
+    /// ignores the side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if margin cannot be computed (e.g. invalid instrument).
+    fn calculate_maintenance_margin_for_side(
+        &self,
+        instrument: &dyn Instrument,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let _ = side;
+        self.calculate_maintenance_margin(
+            instrument,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
 }
 
 /// Shared runtime handle for a margin model.
@@ -120,6 +171,44 @@ impl MarginModel for MarginModelHandle {
     ) -> anyhow::Result<Money> {
         self.0.calculate_maintenance_margin(
             instrument,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
+
+    fn calculate_initial_margin_for_side(
+        &self,
+        instrument: &dyn Instrument,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        self.0.calculate_initial_margin_for_side(
+            instrument,
+            side,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
+
+    fn calculate_maintenance_margin_for_side(
+        &self,
+        instrument: &dyn Instrument,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        self.0.calculate_maintenance_margin_for_side(
+            instrument,
+            side,
             quantity,
             price,
             leverage,
@@ -671,5 +760,128 @@ mod tests {
 
         let expected = Decimal::from(50000) / leverage * instrument.margin_maint();
         assert_eq!(margin.as_decimal(), expected);
+    }
+
+    /// A model whose requirement is the side: 1 USDT for a buy or long, 2 for a sell or short,
+    /// and an error when the side is not passed.
+    struct SideMarginModel;
+
+    impl SideMarginModel {
+        fn by_side(side: OrderSide) -> Money {
+            match side {
+                OrderSide::Buy => Money::from("1 USDT"),
+                OrderSide::Sell => Money::from("2 USDT"),
+            }
+        }
+    }
+
+    impl MarginModel for SideMarginModel {
+        fn name(&self) -> &'static str {
+            "side"
+        }
+
+        fn calculate_initial_margin(
+            &self,
+            _instrument: &dyn Instrument,
+            _quantity: Quantity,
+            _price: Price,
+            _leverage: Decimal,
+            _use_quote_for_inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            anyhow::bail!("side not passed")
+        }
+
+        fn calculate_maintenance_margin(
+            &self,
+            _instrument: &dyn Instrument,
+            _quantity: Quantity,
+            _price: Price,
+            _leverage: Decimal,
+            _use_quote_for_inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            anyhow::bail!("side not passed")
+        }
+
+        fn calculate_initial_margin_for_side(
+            &self,
+            _instrument: &dyn Instrument,
+            side: OrderSide,
+            _quantity: Quantity,
+            _price: Price,
+            _leverage: Decimal,
+            _use_quote_for_inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            Ok(Self::by_side(side))
+        }
+
+        fn calculate_maintenance_margin_for_side(
+            &self,
+            _instrument: &dyn Instrument,
+            side: OrderSide,
+            _quantity: Quantity,
+            _price: Price,
+            _leverage: Decimal,
+            _use_quote_for_inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            Ok(Self::by_side(side))
+        }
+    }
+
+    #[rstest]
+    fn test_handle_forwards_the_side() {
+        let handle = MarginModelHandle::new(SideMarginModel);
+        let instrument = ethusdt();
+        let (quantity, price) = (Quantity::from("1.000"), Price::from("5000.00"));
+
+        for side in [OrderSide::Buy, OrderSide::Sell] {
+            let initial = handle
+                .calculate_initial_margin_for_side(&instrument, side, quantity, price, dec!(1), None)
+                .unwrap();
+            let maintenance = handle
+                .calculate_maintenance_margin_for_side(
+                    &instrument,
+                    side,
+                    quantity,
+                    price,
+                    dec!(1),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(initial, SideMarginModel::by_side(side));
+            assert_eq!(maintenance, SideMarginModel::by_side(side));
+        }
+    }
+
+    #[rstest]
+    #[case(MarginModelAny::Standard(StandardMarginModel))]
+    #[case(MarginModelAny::Leveraged(LeveragedMarginModel))]
+    fn test_side_defaults_to_the_sideless_calculation(#[case] model: MarginModelAny) {
+        let instrument = ethusdt();
+        let (quantity, price, leverage) =
+            (Quantity::from("10.000"), Price::from("5000.00"), dec!(10));
+        let initial = model
+            .calculate_initial_margin(&instrument, quantity, price, leverage, None)
+            .unwrap();
+        let maintenance = model
+            .calculate_maintenance_margin(&instrument, quantity, price, leverage, None)
+            .unwrap();
+
+        for side in [OrderSide::Buy, OrderSide::Sell] {
+            let initial_for_side = model
+                .calculate_initial_margin_for_side(&instrument, side, quantity, price, leverage, None)
+                .unwrap();
+            let maintenance_for_side = model
+                .calculate_maintenance_margin_for_side(
+                    &instrument,
+                    side,
+                    quantity,
+                    price,
+                    leverage,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(initial_for_side, initial);
+            assert_eq!(maintenance_for_side, maintenance);
+        }
     }
 }

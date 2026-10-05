@@ -1647,8 +1647,9 @@ impl RiskEngine {
             if is_margin {
                 // Margin account: check initial margin requirement
                 let margin_req = match &mut account {
-                    AccountAny::Margin(margin) => match margin.calculate_initial_margin(
+                    AccountAny::Margin(margin) => match margin.calculate_initial_margin_for_side(
                         instrument,
+                        order.order_side(),
                         effective_quantity,
                         last_px,
                         None,

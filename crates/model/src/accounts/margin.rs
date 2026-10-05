@@ -429,6 +429,62 @@ impl MarginAccount {
         )
     }
 
+    /// Calculates the initial margin amount for an order on `side`.
+    ///
+    /// Delegates to the configured [`MarginModel`]'s side-aware method; the engine's pre-trade
+    /// check and order-margin update call this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot compute the margin, or if the result cannot be
+    /// represented as `Money`.
+    pub fn calculate_initial_margin_for_side<T: Instrument>(
+        &self,
+        instrument: &T,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let leverage = self.get_leverage(&instrument.id());
+        self.margin_model.calculate_initial_margin_for_side(
+            instrument,
+            side,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
+
+    /// Calculates the maintenance margin amount for a net position whose entry side is `side`.
+    ///
+    /// Delegates to the configured [`MarginModel`]'s side-aware method; the engine's
+    /// position-margin update calls this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot compute the margin, or if the result cannot be
+    /// represented as `Money`.
+    pub fn calculate_maintenance_margin_for_side<T: Instrument>(
+        &self,
+        instrument: &T,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let leverage = self.get_leverage(&instrument.id());
+        self.margin_model.calculate_maintenance_margin_for_side(
+            instrument,
+            side,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
+
     /// Recalculates the account balance for the specified currency based on current margins.
     ///
     /// If the margins cannot be totaled, the balance is reserved in full so no further orders
