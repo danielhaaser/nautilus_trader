@@ -336,6 +336,18 @@ impl BacktestEngine {
         }
     }
 
+    /// Removes the matching engines of settled instruments from every venue, returning how many.
+    ///
+    /// For long streamed backtests over many expiring instruments: call it between `run`
+    /// batches to release engines whose instruments have expired and settled with nothing left
+    /// open. Results are unchanged; see [`SimulatedExchange::remove_settled_instruments`].
+    pub fn remove_settled_instruments(&mut self) -> usize {
+        self.venues
+            .values()
+            .map(|exchange| exchange.borrow_mut().remove_settled_instruments())
+            .sum()
+    }
+
     /// Adds an instrument to the backtest engine for the specified venue.
     ///
     /// # Errors

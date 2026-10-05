@@ -52,7 +52,10 @@ use nautilus_model::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
     },
-    enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
+    enums::{
+        AccountType, AggressorSide, BookType, MarketStatus, OmsType, OrderStatus,
+        PositionAdjustmentType,
+    },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -160,8 +163,13 @@ pub struct SimulatedExchange {
     fill_model: FillModelHandle,
     latency_model: Option<LatencyModelHandle>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
-    matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
+    matching_engines: MatchingEngines,
     last_raw_id: u32,
+    /// What an engine removed by [`Self::remove_settled_instruments`] needs to be rebuilt in its
+    /// settled state if anything addresses its instrument again: its raw ID and market status.
+    removed_engines: AHashMap<InstrumentId, (u32, MarketStatus)>,
+    /// Engines settled by an expiration instant, awaiting a removal sweep.
+    settled_engines: Vec<InstrumentId>,
     /// Registration order of each instrument's matching engine (kept when an instrument is
     /// re-added, as the engine map keeps its position), so expiration processing can visit
     /// due engines in the engine map's order without walking the whole map.
@@ -207,6 +215,88 @@ pub struct SimulatedExchange {
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
     liquidation_cancel_open_orders: bool,
+}
+
+/// A simulated exchange's matching engines, in registration order.
+///
+/// An engine can be taken out once its instrument has settled
+/// ([`SimulatedExchange::remove_settled_instruments`]); its slot stays, so the instrument keeps
+/// its position in the engine order if its engine is rebuilt or the instrument is re-added.
+/// Engines are boxed so a removed engine's memory is released.
+#[derive(Debug, Default)]
+pub struct MatchingEngines {
+    slots: IndexMap<InstrumentId, Option<Box<OrderMatchingEngine>>>,
+    live: usize,
+}
+
+impl MatchingEngines {
+    /// Returns the engine for `instrument_id`, if one is registered and not removed.
+    #[must_use]
+    pub fn get(&self, instrument_id: &InstrumentId) -> Option<&OrderMatchingEngine> {
+        self.slots.get(instrument_id).and_then(Option::as_deref)
+    }
+
+    fn get_mut(&mut self, instrument_id: &InstrumentId) -> Option<&mut OrderMatchingEngine> {
+        self.slots
+            .get_mut(instrument_id)
+            .and_then(Option::as_deref_mut)
+    }
+
+    /// Returns whether an engine is registered (and not removed) for `instrument_id`.
+    #[must_use]
+    pub fn contains_key(&self, instrument_id: &InstrumentId) -> bool {
+        self.get(instrument_id).is_some()
+    }
+
+    /// Returns the number of engines (removed ones excluded).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.live
+    }
+
+    /// Returns whether there are no engines (removed ones excluded).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Iterates the engines in registration order (removed ones excluded).
+    pub fn iter(&self) -> impl Iterator<Item = (&InstrumentId, &OrderMatchingEngine)> {
+        self.slots.iter().filter_map(|(instrument_id, slot)| {
+            slot.as_deref().map(|engine| (instrument_id, engine))
+        })
+    }
+
+    /// Iterates the instrument IDs of the engines in registration order (removed ones excluded).
+    pub fn keys(&self) -> impl Iterator<Item = &InstrumentId> {
+        self.iter().map(|(instrument_id, _)| instrument_id)
+    }
+
+    /// Iterates the engines in registration order (removed ones excluded).
+    pub fn values(&self) -> impl Iterator<Item = &OrderMatchingEngine> {
+        self.slots.values().filter_map(Option::as_deref)
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut OrderMatchingEngine> {
+        self.slots.values_mut().filter_map(Option::as_deref_mut)
+    }
+
+    fn insert(&mut self, instrument_id: InstrumentId, engine: OrderMatchingEngine) {
+        if !matches!(
+            self.slots.insert(instrument_id, Some(Box::new(engine))),
+            Some(Some(_))
+        ) {
+            self.live += 1;
+        }
+    }
+
+    fn take(&mut self, instrument_id: &InstrumentId) -> Option<Box<OrderMatchingEngine>> {
+        let engine = self.slots.get_mut(instrument_id)?.take();
+        if engine.is_some() {
+            self.live -= 1;
+        }
+        engine
+    }
 }
 
 impl Debug for SimulatedExchange {
@@ -262,8 +352,10 @@ impl SimulatedExchange {
             fill_model: config.fill_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
-            matching_engines: IndexMap::new(),
+            matching_engines: MatchingEngines::default(),
             last_raw_id: 0,
+            removed_engines: AHashMap::new(),
+            settled_engines: Vec::new(),
             engine_seq: AHashMap::new(),
             next_engine_seq: 0,
             expirations_pending: BTreeMap::new(),
@@ -396,6 +488,12 @@ impl SimulatedExchange {
     /// Returns the expiration timestamp for the given instrument, if present.
     #[must_use]
     pub fn instrument_expiration(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
+        if self.removed_engines.contains_key(&instrument_id) {
+            return self
+                .instruments
+                .get(&instrument_id)
+                .and_then(InstrumentAny::expiration_ns);
+        }
         self.matching_engines
             .get(&instrument_id)
             .and_then(|matching_engine| matching_engine.instrument.expiration_ns())
@@ -481,6 +579,33 @@ impl SimulatedExchange {
             anyhow::bail!("Cash account cannot trade futures or perpetuals")
         }
 
+        let instrument_id = instrument.id();
+        let raw_id = self
+            .last_raw_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("matching engine raw ID exhausted at u32::MAX"))?;
+        self.last_raw_id = raw_id;
+        let matching_engine = self.build_matching_engine(instrument.clone(), raw_id);
+        self.instruments.insert(instrument_id, instrument);
+        self.removed_engines.remove(&instrument_id);
+        let expiration_ns = matching_engine.instrument.expiration_ns();
+        self.matching_engines.insert(instrument_id, matching_engine);
+        if !self.engine_seq.contains_key(&instrument_id) {
+            self.engine_seq.insert(instrument_id, self.next_engine_seq);
+            self.next_engine_seq += 1;
+        }
+        if let Some(expiration_ns) = expiration_ns {
+            self.expirations_pending
+                .entry(expiration_ns)
+                .or_default()
+                .push(instrument_id);
+        }
+
+        log::info!("Added instrument {instrument_id} and created matching engine");
+        Ok(())
+    }
+
+    fn build_matching_engine(&self, instrument: InstrumentAny, raw_id: u32) -> OrderMatchingEngine {
         let price_protection = if self.price_protection_points == 0 {
             None
         } else {
@@ -504,14 +629,8 @@ impl SimulatedExchange {
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)
             .build();
-        let instrument_id = instrument.id();
-        let raw_id = self
-            .last_raw_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("matching engine raw ID exhausted at u32::MAX"))?;
-        self.last_raw_id = raw_id;
         let mut matching_engine = OrderMatchingEngine::new(
-            instrument.clone(),
+            instrument,
             raw_id,
             self.fill_model.clone(),
             self.fee_model.clone(),
@@ -526,23 +645,104 @@ impl SimulatedExchange {
         if let Some(handler) = &self.event_handler {
             matching_engine.set_event_handler(Rc::clone(handler));
         }
-        self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
-        let expiration_ns = matching_engine.instrument.expiration_ns();
-        self.matching_engines.insert(instrument_id, matching_engine);
-        if !self.engine_seq.contains_key(&instrument_id) {
-            self.engine_seq.insert(instrument_id, self.next_engine_seq);
-            self.next_engine_seq += 1;
-        }
-        if let Some(expiration_ns) = expiration_ns {
-            self.expirations_pending
-                .entry(expiration_ns)
-                .or_default()
-                .push(instrument_id);
-        }
+        matching_engine
+    }
 
-        log::info!("Added instrument {instrument_id} and created matching engine");
-        Ok(())
+    /// Removes the matching engines of instruments that have settled, returning how many.
+    ///
+    /// A long backtest over many expiring instruments otherwise keeps every engine it ever
+    /// registered. An engine is removed once an expiration instant has processed its expiration
+    /// (not an option contract's, whose settlement can be deferred or fail), the clock is at or
+    /// past that expiration, and nothing can still act on it: no open order in the engine or the
+    /// cache, no open position, no queued or inflight command, and no simulation module (modules
+    /// keep per-instrument state). From then on every order for it is rejected and market data
+    /// moves nothing but its book, so if a command or data does address it again the engine is
+    /// rebuilt with its raw ID in that settled state (`OrderMatchingEngine::restore_settled`) and
+    /// behaves as the removed one would have. Its slot keeps the instrument's position in the
+    /// engine order, and the instrument itself stays registered.
+    pub fn remove_settled_instruments(&mut self) -> usize {
+        if self.has_modules() || self.settled_engines.is_empty() {
+            return 0;
+        }
+        let ts_now = self.clock.borrow().timestamp_ns();
+        let candidates = std::mem::take(&mut self.settled_engines);
+        let mut removed = 0;
+        for instrument_id in candidates {
+            match self.removable(&instrument_id, ts_now) {
+                Some(true) => {
+                    let matching_engine = self
+                        .matching_engines
+                        .take(&instrument_id)
+                        .expect("a removable engine is registered");
+                    self.removed_engines.insert(
+                        instrument_id,
+                        (matching_engine.raw_id, matching_engine.market_status),
+                    );
+                    removed += 1;
+                }
+                // Still in use: try again at the next sweep.
+                Some(false) => self.settled_engines.push(instrument_id),
+                // Gone, re-added unsettled, or not removable by kind.
+                None => {}
+            }
+        }
+        removed
+    }
+
+    fn removable(&self, instrument_id: &InstrumentId, ts_now: UnixNanos) -> Option<bool> {
+        let matching_engine = self.matching_engines.get(instrument_id)?;
+        if !matching_engine.is_expiration_processed()
+            || matches!(
+                matching_engine.instrument,
+                InstrumentAny::OptionContract(_) | InstrumentAny::CryptoOption(_)
+            )
+            || !matching_engine
+                .instrument
+                .expiration_ns()
+                .is_some_and(|expiration_ns| ts_now >= expiration_ns)
+        {
+            return None;
+        }
+        if !matching_engine.get_open_orders().is_empty()
+            || self
+                .message_queue
+                .iter()
+                .any(|command| command.instrument_id() == *instrument_id)
+            || self
+                .inflight_queue
+                .iter()
+                .any(|inflight| inflight.command.instrument_id() == *instrument_id)
+        {
+            return Some(false);
+        }
+        let cache = self.cache.borrow();
+        let in_use = cache.orders_open_count(None, Some(instrument_id), None, None, None) > 0
+            || cache.orders_inflight_count(None, Some(instrument_id), None, None, None) > 0
+            || cache.positions_open_count(None, Some(instrument_id), None, None, None) > 0;
+        Some(!in_use)
+    }
+
+    /// Rebuilds the engine [`Self::remove_settled_instruments`] removed for `instrument_id`, if
+    /// it removed one, before anything addresses it.
+    fn revive_matching_engine(&mut self, instrument_id: InstrumentId) {
+        let Some((raw_id, market_status)) = self.removed_engines.remove(&instrument_id) else {
+            return;
+        };
+        let instrument = self
+            .instruments
+            .get(&instrument_id)
+            .cloned()
+            .expect("a removed engine's instrument stays registered");
+        let mut matching_engine = self.build_matching_engine(instrument, raw_id);
+        matching_engine.restore_settled(market_status);
+        self.matching_engines.insert(instrument_id, matching_engine);
+    }
+
+    /// Whether an engine exists for `instrument_id`, rebuilding a removed one first.
+    fn engine_ready(&mut self, instrument_id: InstrumentId) -> bool {
+        self.revive_matching_engine(instrument_id);
+        self.matching_engines.contains_key(&instrument_id)
     }
 
     /// Sets the deferred event handler used while a trading command is processed
@@ -600,7 +800,7 @@ impl SimulatedExchange {
 
     /// Returns a reference to all matching engines keyed by instrument ID.
     #[must_use]
-    pub const fn get_matching_engines(&self) -> &IndexMap<InstrumentId, OrderMatchingEngine> {
+    pub const fn get_matching_engines(&self) -> &MatchingEngines {
         &self.matching_engines
     }
 
@@ -608,7 +808,7 @@ impl SimulatedExchange {
     #[must_use]
     pub fn get_books(&self) -> AHashMap<InstrumentId, OrderBook> {
         let mut books = AHashMap::new();
-        for (instrument_id, matching_engine) in &self.matching_engines {
+        for (instrument_id, matching_engine) in self.matching_engines.iter() {
             books.insert(*instrument_id, matching_engine.get_book().clone());
         }
         books
@@ -851,6 +1051,7 @@ impl SimulatedExchange {
             }
             if matching_engine.is_expiration_settled() {
                 self.expirations_due.remove(&seq);
+                self.settled_engines.push(instrument_id);
             }
         }
     }
@@ -865,7 +1066,7 @@ impl SimulatedExchange {
     fn rebuild_expiration_index(&mut self) {
         self.expirations_pending.clear();
         self.expirations_due.clear();
-        for (instrument_id, matching_engine) in &self.matching_engines {
+        for (instrument_id, matching_engine) in self.matching_engines.iter() {
             if let Some(expiration_ns) = matching_engine.instrument.expiration_ns() {
                 self.expirations_pending
                     .entry(expiration_ns)
@@ -970,7 +1171,7 @@ impl SimulatedExchange {
     pub fn process_order_book_delta(&mut self, delta: OrderBookDelta) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDelta(delta))?;
 
-        if !self.matching_engines.contains_key(&delta.instrument_id) {
+        if !self.engine_ready(delta.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&delta.instrument_id).cloned()
@@ -1002,7 +1203,7 @@ impl SimulatedExchange {
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
 
-        if !self.matching_engines.contains_key(&deltas.instrument_id) {
+        if !self.engine_ready(deltas.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&deltas.instrument_id).cloned()
@@ -1034,7 +1235,7 @@ impl SimulatedExchange {
     pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
 
-        if !self.matching_engines.contains_key(&depth.instrument_id) {
+        if !self.engine_ready(depth.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&depth.instrument_id).cloned()
@@ -1066,7 +1267,7 @@ impl SimulatedExchange {
     pub fn process_quote_tick(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::Quote(*quote))?;
 
-        if !self.matching_engines.contains_key(&quote.instrument_id) {
+        if !self.engine_ready(quote.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&quote.instrument_id).cloned()
@@ -1098,7 +1299,7 @@ impl SimulatedExchange {
     pub fn process_trade_tick(&mut self, trade: &TradeTick) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::Trade(*trade))?;
 
-        if !self.matching_engines.contains_key(&trade.instrument_id) {
+        if !self.engine_ready(trade.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&trade.instrument_id).cloned()
@@ -1130,7 +1331,7 @@ impl SimulatedExchange {
     pub fn process_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::Bar(bar))?;
 
-        if !self.matching_engines.contains_key(&bar.instrument_id()) {
+        if !self.engine_ready(bar.instrument_id()) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&bar.instrument_id()).cloned()
@@ -1162,7 +1363,7 @@ impl SimulatedExchange {
     pub fn process_instrument_status(&mut self, status: InstrumentStatus) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::InstrumentStatus(status))?;
 
-        if !self.matching_engines.contains_key(&status.instrument_id) {
+        if !self.engine_ready(status.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&status.instrument_id).cloned()
@@ -1194,7 +1395,7 @@ impl SimulatedExchange {
     pub fn process_instrument_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::InstrumentClose(close))?;
 
-        if !self.matching_engines.contains_key(&close.instrument_id) {
+        if !self.engine_ready(close.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&close.instrument_id).cloned()
@@ -1355,10 +1556,7 @@ impl SimulatedExchange {
         let account_id = exec_client.account_id();
         let account_venue = exec_client.venue();
 
-        if !self
-            .matching_engines
-            .contains_key(&funding_rate.instrument_id)
-        {
+        if !self.engine_ready(funding_rate.instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
                 cache.instrument(&funding_rate.instrument_id).cloned()
@@ -1790,6 +1988,11 @@ impl SimulatedExchange {
             }
         }
 
+        let removed: Vec<InstrumentId> = self.removed_engines.keys().copied().collect();
+        for instrument_id in removed {
+            self.revive_matching_engine(instrument_id);
+        }
+        self.settled_engines.clear();
         for matching_engine in self.matching_engines.values_mut() {
             matching_engine.reset();
         }
@@ -1937,6 +2140,19 @@ impl SimulatedExchange {
     fn process_trading_command(&mut self, command: TradingCommand) {
         self.inflight_orders.remove(&command);
         let instrument_id = command.instrument_id();
+        self.revive_matching_engine(instrument_id);
+        if let TradingCommand::SubmitOrderList(ref command) = command {
+            let order_instrument_ids: Vec<InstrumentId> = self
+                .cache
+                .borrow()
+                .orders_for_ids(&command.order_list.client_order_ids, command)
+                .iter()
+                .map(OrderAny::instrument_id)
+                .collect();
+            for order_instrument_id in order_instrument_ids {
+                self.revive_matching_engine(order_instrument_id);
+            }
+        }
         assert!(
             self.matching_engines.contains_key(&instrument_id),
             "Matching engine not found for instrument {instrument_id}",
