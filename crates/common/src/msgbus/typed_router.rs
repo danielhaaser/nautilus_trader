@@ -24,7 +24,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use indexmap::IndexMap;
+use ahash::AHashMap;
 use smallvec::SmallVec;
 use ustr::Ustr;
 
@@ -113,13 +113,34 @@ impl<T: 'static> Hash for TypedSubscription<T> {
 /// Routes messages of type `T` to subscribed handlers based on topic patterns.
 ///
 /// Supports wildcard patterns (`*` and `?`) and priority-based ordering.
-/// Caches topic-to-subscription mappings for efficient repeated lookups.
-#[derive(Debug)]
+///
+/// Subscriptions are indexed by kind. A wildcard-free pattern matches exactly one topic (its
+/// own text), so exact subscriptions live in a map keyed by that topic and a publish to it is a
+/// single lookup. Wildcard subscriptions are kept in one list, and the handlers a topic matches
+/// are cached per topic while any wildcard subscription exists. Subscribing or unsubscribing an
+/// exact pattern invalidates only its own topic's cache entry; a wildcard change clears the
+/// cache. Delivery order is unchanged: priority descending, then pattern, then handler ID.
 pub struct TopicRouter<T: 'static> {
-    /// All active subscriptions.
-    pub(crate) subscriptions: Vec<TypedSubscription<T>>,
-    /// Cache mapping topics to matching subscription indices (inline for ≤64 handlers).
-    topic_cache: IndexMap<MStr<Topic>, SmallVec<[usize; 64]>>,
+    /// Exact (wildcard-free) subscriptions by topic, each list in delivery order.
+    exact: AHashMap<Ustr, SmallVec<[TypedSubscription<T>; 1]>>,
+    /// Wildcard subscriptions, in delivery order.
+    wildcards: Vec<TypedSubscription<T>>,
+    /// Number of active subscriptions.
+    count: usize,
+    /// Handlers matching each published topic, in delivery order; used only while wildcard
+    /// subscriptions exist (exact-only topics are a direct lookup).
+    topic_cache: AHashMap<Ustr, SmallVec<[TypedHandler<T>; 4]>>,
+}
+
+impl<T: 'static> Debug for TopicRouter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(TopicRouter))
+            .field("subscriptions", &self.count)
+            .field("exact_topics", &self.exact.len())
+            .field("wildcards", &self.wildcards.len())
+            .field("cached_topics", &self.topic_cache.len())
+            .finish()
+    }
 }
 
 impl<T: 'static> Default for TopicRouter<T> {
@@ -128,33 +149,51 @@ impl<T: 'static> Default for TopicRouter<T> {
     }
 }
 
+fn is_exact(pattern: MStr<Pattern>) -> bool {
+    !pattern.as_bytes().iter().any(|&b| b == b'*' || b == b'?')
+}
+
 impl<T: 'static> TopicRouter<T> {
     /// Creates a new empty topic router.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            subscriptions: Vec::new(),
-            topic_cache: IndexMap::new(),
+            exact: AHashMap::new(),
+            wildcards: Vec::new(),
+            count: 0,
+            topic_cache: AHashMap::new(),
         }
     }
 
     /// Returns the number of active subscriptions.
     #[must_use]
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
+        self.count
     }
 
     /// Returns whether there are any subscriptions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.subscriptions.is_empty()
+        self.count == 0
+    }
+
+    /// All subscriptions in delivery order.
+    fn ordered_subscriptions(&self) -> Vec<&TypedSubscription<T>> {
+        let mut all: Vec<&TypedSubscription<T>> = self
+            .exact
+            .values()
+            .flat_map(|subs| subs.iter())
+            .chain(self.wildcards.iter())
+            .collect();
+        all.sort_by(|a, b| a.delivery_order(b));
+        all
     }
 
     /// Returns all active subscription patterns.
     #[must_use]
     pub fn patterns(&self) -> Vec<&str> {
-        self.subscriptions
-            .iter()
+        self.ordered_subscriptions()
+            .into_iter()
             .map(|s| s.pattern.as_str())
             .collect()
     }
@@ -162,8 +201,8 @@ impl<T: 'static> TopicRouter<T> {
     /// Returns all subscription handler IDs.
     #[must_use]
     pub fn handler_ids(&self) -> Vec<&str> {
-        self.subscriptions
-            .iter()
+        self.ordered_subscriptions()
+            .into_iter()
             .map(|s| s.handler_id.as_str())
             .collect()
     }
@@ -179,20 +218,66 @@ impl<T: 'static> TopicRouter<T> {
 
         // Re-subscribing the same handler is expected (e.g. book deltas + snapshots
         // share one BookUpdater), so dedup at debug rather than warn.
-        if self.subscriptions.iter().any(|s| s == &sub) {
+        if self.find(pattern, sub.handler_id).is_some() {
             log::debug!("{sub:?} already exists; skipping duplicate subscription");
             return;
         }
 
         log::debug!("Subscribing {sub:?}");
 
-        self.subscriptions.push(sub);
+        // Insert at the delivery position: priority descending, pattern ascending, then
+        // handler ID ascending.
+        if is_exact(pattern) {
+            let subs = self.exact.entry(*pattern).or_default();
+            let idx = subs.partition_point(|s| s.delivery_order(&sub) == Ordering::Less);
+            subs.insert(idx, sub);
+            self.topic_cache.remove(&*pattern);
+        } else {
+            let idx = self
+                .wildcards
+                .partition_point(|s| s.delivery_order(&sub) == Ordering::Less);
+            self.wildcards.insert(idx, sub);
+            self.topic_cache.clear();
+        }
+        self.count += 1;
+    }
 
-        // Re-sort by priority descending, pattern ascending, then handler ID ascending.
-        // Clear the index cache since sorting can rearrange all indices.
-        self.subscriptions
-            .sort_by(TypedSubscription::delivery_order);
-        self.topic_cache.clear();
+    /// Returns the position of the (pattern, handler ID) subscription in its list: the topic's
+    /// exact list for a wildcard-free pattern, else the wildcard list.
+    fn find(&self, pattern: MStr<Pattern>, handler_id: Ustr) -> Option<usize> {
+        if is_exact(pattern) {
+            self.exact
+                .get(&*pattern)
+                .and_then(|subs| subs.iter().position(|s| s.handler_id == handler_id))
+        } else {
+            self.wildcards
+                .iter()
+                .position(|s| s.pattern == pattern && s.handler_id == handler_id)
+        }
+    }
+
+    /// Removes the (pattern, handler ID) subscription, returning whether one was removed.
+    fn remove(&mut self, pattern: MStr<Pattern>, handler_id: Ustr) -> bool {
+        let Some(idx) = self.find(pattern, handler_id) else {
+            return false;
+        };
+
+        if is_exact(pattern) {
+            let subs = self
+                .exact
+                .get_mut(&*pattern)
+                .expect("found subscription's topic is indexed");
+            subs.remove(idx);
+            if subs.is_empty() {
+                self.exact.remove(&*pattern);
+            }
+            self.topic_cache.remove(&*pattern);
+        } else {
+            self.wildcards.remove(idx);
+            self.topic_cache.clear();
+        }
+        self.count -= 1;
+        true
     }
 
     /// Unsubscribes a handler from a topic pattern.
@@ -202,18 +287,7 @@ impl<T: 'static> TopicRouter<T> {
             handler.id()
         );
 
-        let handler_id = handler.id();
-
-        if let Some(idx) = self
-            .subscriptions
-            .iter()
-            .position(|s| s.pattern == pattern && s.handler_id == handler_id)
-        {
-            self.subscriptions.remove(idx);
-
-            // Must clear entire cache since remove() shifts indices
-            self.topic_cache.clear();
-
+        if self.remove(pattern, handler.id()) {
             log::debug!("Handler for pattern '{pattern}' was removed");
         } else {
             log::debug!("No matching handler for pattern '{pattern}' was found");
@@ -222,15 +296,7 @@ impl<T: 'static> TopicRouter<T> {
 
     /// Removes a specific handler from a pattern by handler ID.
     pub fn remove_handler(&mut self, pattern: MStr<Pattern>, handler_id: Ustr) {
-        if let Some(idx) = self
-            .subscriptions
-            .iter()
-            .position(|s| s.pattern == pattern && s.handler_id == handler_id)
-        {
-            self.subscriptions.remove(idx);
-
-            // Must clear entire cache since remove() shifts indices
-            self.topic_cache.clear();
+        if self.remove(pattern, handler_id) {
             log::debug!("Handler {handler_id} for pattern '{pattern}' was removed");
         }
     }
@@ -238,55 +304,87 @@ impl<T: 'static> TopicRouter<T> {
     /// Checks if a handler is subscribed to a pattern.
     #[must_use]
     pub fn is_subscribed(&self, pattern: MStr<Pattern>, handler: &TypedHandler<T>) -> bool {
-        let handler_id = handler.id();
-        self.subscriptions
-            .iter()
-            .any(|s| s.pattern == pattern && s.handler_id == handler_id)
+        self.find(pattern, handler.id()).is_some()
     }
 
     /// Returns whether there are subscribers for the topic.
     #[must_use]
     pub fn has_subscribers(&self, topic: MStr<Topic>) -> bool {
-        self.get_matching_indices(topic).map_or_else(
-            || !Self::find_matches(&self.subscriptions, topic).is_empty(),
-            |indices| !indices.is_empty(),
-        )
+        self.exact.contains_key(&*topic)
+            || self
+                .wildcards
+                .iter()
+                .any(|s| is_matching_backtracking(topic, s.pattern))
     }
 
     /// Returns the count of subscribers for a topic.
     #[must_use]
     pub fn subscriber_count(&self, topic: MStr<Topic>) -> usize {
-        self.get_matching_indices(topic).map_or_else(
-            || Self::find_matches(&self.subscriptions, topic).len(),
-            <[usize]>::len,
-        )
+        self.exact_subscriber_count(topic)
+            + self
+                .wildcards
+                .iter()
+                .filter(|s| is_matching_backtracking(topic, s.pattern))
+                .count()
     }
 
     /// Returns the count of subscribers with an exact topic match,
     /// excluding wildcard pattern subscriptions.
     #[must_use]
     pub fn exact_subscriber_count(&self, topic: MStr<Topic>) -> usize {
-        let pattern: MStr<Pattern> = topic.into();
-        self.subscriptions
+        self.exact.get(&*topic).map_or(0, |subs| subs.len())
+    }
+
+    /// Handlers matching a topic, in delivery order: the topic's exact subscriptions merged
+    /// with the wildcard subscriptions that match it.
+    fn compute_handlers(
+        exact: &AHashMap<Ustr, SmallVec<[TypedSubscription<T>; 1]>>,
+        wildcards: &[TypedSubscription<T>],
+        topic: MStr<Topic>,
+    ) -> SmallVec<[TypedHandler<T>; 4]> {
+        let exact_subs: &[TypedSubscription<T>] = exact.get(&*topic).map_or(&[], |s| s.as_slice());
+        let mut exact_iter = exact_subs.iter().peekable();
+        let mut handlers = SmallVec::new();
+
+        for wildcard in wildcards
             .iter()
-            .filter(|s| s.pattern == pattern)
-            .count()
+            .filter(|s| is_matching_backtracking(topic, s.pattern))
+        {
+            while let Some(sub) =
+                exact_iter.next_if(|s| s.delivery_order(wildcard) == Ordering::Less)
+            {
+                handlers.push(sub.handler.clone());
+            }
+            handlers.push(wildcard.handler.clone());
+        }
+        handlers.extend(exact_iter.map(|s| s.handler.clone()));
+        handlers
     }
 
     /// Publishes a message to all handlers subscribed to matching patterns.
     pub fn publish(&mut self, topic: MStr<Topic>, message: &T) {
-        // Split borrow to avoid copying indices
+        if self.wildcards.is_empty() {
+            if let Some(subs) = self.exact.get(&*topic) {
+                for sub in subs {
+                    sub.handler.handle(message);
+                }
+            }
+            return;
+        }
+
         let Self {
-            subscriptions,
+            exact,
+            wildcards,
             topic_cache,
+            ..
         } = self;
 
-        let indices = topic_cache
-            .entry(topic)
-            .or_insert_with(|| Self::find_matches(subscriptions, topic));
+        let handlers = topic_cache
+            .entry(*topic)
+            .or_insert_with(|| Self::compute_handlers(exact, wildcards, topic));
 
-        for &idx in indices.iter() {
-            subscriptions[idx].handler.handle(message);
+        for handler in handlers.iter() {
+            handler.handle(message);
         }
     }
 
@@ -296,33 +394,9 @@ impl<T: 'static> TopicRouter<T> {
     /// Note: Allocates a Vec on each call. For hot paths, prefer the thread-local
     /// buffer pattern used by `publish_*` functions.
     pub fn get_matching_handlers(&mut self, topic: MStr<Topic>) -> Vec<TypedHandler<T>> {
-        let indices: SmallVec<[usize; 64]> = self
-            .get_or_compute_matching_indices(topic)
-            .iter()
-            .copied()
-            .collect();
-        indices
-            .into_iter()
-            .map(|idx| self.subscriptions[idx].handler.clone())
-            .collect()
-    }
-
-    /// Gets cached matching indices for a topic, if available.
-    fn get_matching_indices(&self, topic: MStr<Topic>) -> Option<&[usize]> {
-        self.topic_cache.get(&topic).map(SmallVec::as_slice)
-    }
-
-    /// Gets or computes matching subscription indices for a topic.
-    fn get_or_compute_matching_indices(&mut self, topic: MStr<Topic>) -> &[usize] {
-        let Self {
-            subscriptions,
-            topic_cache,
-        } = self;
-
-        topic_cache
-            .entry(topic)
-            .or_insert_with(|| Self::find_matches(subscriptions, topic))
-            .as_slice()
+        let mut buf: SmallVec<[TypedHandler<T>; 64]> = SmallVec::new();
+        self.fill_matching_handlers(topic, &mut buf);
+        buf.into_vec()
     }
 
     /// Fills a buffer with handlers matching a topic.
@@ -331,35 +405,32 @@ impl<T: 'static> TopicRouter<T> {
         topic: MStr<Topic>,
         buf: &mut SmallVec<[TypedHandler<T>; 64]>,
     ) {
+        if self.wildcards.is_empty() {
+            if let Some(subs) = self.exact.get(&*topic) {
+                buf.extend(subs.iter().map(|s| s.handler.clone()));
+            }
+            return;
+        }
+
         let Self {
-            subscriptions,
+            exact,
+            wildcards,
             topic_cache,
+            ..
         } = self;
 
-        let indices = topic_cache
-            .entry(topic)
-            .or_insert_with(|| Self::find_matches(subscriptions, topic));
+        let handlers = topic_cache
+            .entry(*topic)
+            .or_insert_with(|| Self::compute_handlers(exact, wildcards, topic));
 
-        for &idx in indices.iter() {
-            buf.push(subscriptions[idx].handler.clone());
-        }
-    }
-
-    /// Finds subscription indices matching a topic (without caching).
-    fn find_matches(
-        subscriptions: &[TypedSubscription<T>],
-        topic: MStr<Topic>,
-    ) -> SmallVec<[usize; 64]> {
-        subscriptions
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, sub)| is_matching_backtracking(topic, sub.pattern).then_some(idx))
-            .collect()
+        buf.extend(handlers.iter().cloned());
     }
 
     /// Clears all subscriptions and cache.
     pub fn clear(&mut self) {
-        self.subscriptions.clear();
+        self.exact.clear();
+        self.wildcards.clear();
+        self.count = 0;
         self.topic_cache.clear();
     }
 }
@@ -839,5 +910,108 @@ mod tests {
 
         router.publish(beta_topic, &2);
         assert_eq!(*received.borrow(), 2);
+    }
+
+    /// The router against a reference model of the pre-index design (one list sorted in
+    /// delivery order, every subscription matched linearly per publish), over seeded random
+    /// sequences of exact and wildcard subscribes, unsubscribes, handler removals and publishes.
+    #[rstest]
+    fn test_indexed_router_matches_linear_reference() {
+        let topics = ["data.a.x", "data.a.y", "data.b.x", "events.a", "events.b.x"];
+        let patterns = [
+            "data.a.x",
+            "data.a.y",
+            "data.b.x",
+            "events.a",
+            "events.b.x",
+            "data.*",
+            "data.a.*",
+            "*.x",
+            "events.?",
+            "*",
+        ];
+        let handler_names = ["h0", "h1", "h2", "h3"];
+
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        };
+
+        for _case in 0..200 {
+            let received: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+            let handlers: Vec<TypedHandler<i32>> = handler_names
+                .iter()
+                .map(|&name| {
+                    let received = received.clone();
+                    TypedHandler::from_with_id(name, move |_: &i32| {
+                        received.borrow_mut().push(name);
+                    })
+                })
+                .collect();
+
+            let mut router = TopicRouter::<i32>::new();
+            let mut reference: Vec<TypedSubscription<i32>> = Vec::new();
+
+            for _step in 0..60 {
+                let pattern: MStr<Pattern> = patterns[next(patterns.len())].into();
+                let handler = &handlers[next(handlers.len())];
+                match next(4) {
+                    0 | 1 => {
+                        let priority = next(3) as u32;
+                        router.subscribe(pattern, handler.clone(), priority);
+                        let sub = TypedSubscription::new(pattern, handler.clone(), Some(priority));
+                        if !reference.iter().any(|s| s == &sub) {
+                            reference.push(sub);
+                            reference.sort_by(TypedSubscription::delivery_order);
+                        }
+                    }
+                    2 => {
+                        if next(2) == 0 {
+                            router.unsubscribe(pattern, handler);
+                        } else {
+                            router.remove_handler(pattern, handler.id());
+                        }
+                        reference
+                            .retain(|s| !(s.pattern == pattern && s.handler_id == handler.id()));
+                    }
+                    _ => {
+                        let topic: MStr<Topic> = topics[next(topics.len())].into();
+                        received.borrow_mut().clear();
+                        router.publish(topic, &1);
+                        let expected: Vec<&str> = reference
+                            .iter()
+                            .filter(|s| is_matching_backtracking(topic, s.pattern))
+                            .map(|s| s.handler_id.as_str())
+                            .collect();
+                        assert_eq!(*received.borrow(), expected, "publish to {topic}");
+                        let mut buf = SmallVec::new();
+                        router.fill_matching_handlers(topic, &mut buf);
+                        let filled: Vec<&str> = buf.iter().map(|h| h.id().as_str()).collect();
+                        assert_eq!(filled, expected, "fill for {topic}");
+                        assert_eq!(router.subscriber_count(topic), expected.len());
+                        assert_eq!(router.has_subscribers(topic), !expected.is_empty());
+                        let exact = reference
+                            .iter()
+                            .filter(|s| s.pattern.as_str() == topic.as_str())
+                            .count();
+                        assert_eq!(router.exact_subscriber_count(topic), exact);
+                    }
+                }
+
+                assert_eq!(router.subscription_count(), reference.len());
+                assert_eq!(router.is_empty(), reference.is_empty());
+                let ref_patterns: Vec<&str> =
+                    reference.iter().map(|s| s.pattern.as_str()).collect();
+                assert_eq!(router.patterns(), ref_patterns);
+                let ref_ids: Vec<&str> = reference.iter().map(|s| s.handler_id.as_str()).collect();
+                assert_eq!(router.handler_ids(), ref_ids);
+                for sub in &reference {
+                    assert!(router.is_subscribed(sub.pattern, &sub.handler));
+                }
+            }
+        }
     }
 }
