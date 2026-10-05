@@ -162,6 +162,18 @@ pub struct SimulatedExchange {
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
+    /// Registration order of each instrument's matching engine (kept when an instrument is
+    /// re-added, as the engine map keeps its position), so expiration processing can visit
+    /// due engines in the engine map's order without walking the whole map.
+    engine_seq: AHashMap<InstrumentId, u64>,
+    next_engine_seq: u64,
+    /// Engines whose expiration has not yet been reached by a processed expiration instant,
+    /// keyed by expiration. An entry may be stale (the instrument re-added with another
+    /// expiration); draining re-checks the engine's current expiration.
+    expirations_pending: BTreeMap<UnixNanos, Vec<InstrumentId>>,
+    /// Engines whose expiration has been reached and that are not yet settled (expiration
+    /// processed or option settlement failed), keyed by registration order.
+    expirations_due: BTreeMap<u64, InstrumentId>,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
     leverages: AHashMap<InstrumentId, Decimal>,
@@ -252,6 +264,10 @@ impl SimulatedExchange {
             instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
             last_raw_id: 0,
+            engine_seq: AHashMap::new(),
+            next_engine_seq: 0,
+            expirations_pending: BTreeMap::new(),
+            expirations_due: BTreeMap::new(),
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
             leverages: config.leverages,
@@ -512,7 +528,18 @@ impl SimulatedExchange {
         }
         self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
+        let expiration_ns = matching_engine.instrument.expiration_ns();
         self.matching_engines.insert(instrument_id, matching_engine);
+        if !self.engine_seq.contains_key(&instrument_id) {
+            self.engine_seq.insert(instrument_id, self.next_engine_seq);
+            self.next_engine_seq += 1;
+        }
+        if let Some(expiration_ns) = expiration_ns {
+            self.expirations_pending
+                .entry(expiration_ns)
+                .or_default()
+                .push(instrument_id);
+        }
 
         log::info!("Added instrument {instrument_id} and created matching engine");
         Ok(())
@@ -783,14 +810,67 @@ impl SimulatedExchange {
     }
 
     /// Processes instrument expirations due at the given timestamp.
+    ///
+    /// Visits, in the engine map's order, every matching engine whose instrument expires at or
+    /// before `ts_now` and is not yet settled. A settled engine (expiration processed, or option
+    /// settlement failed) returns from `process_instrument_expiration` without effect, so skipping
+    /// it is exact; the index replaces a walk over every registered engine per instant.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
-        for matching_engine in self.matching_engines.values_mut() {
-            if matching_engine
-                .instrument
-                .expiration_ns()
-                .is_some_and(|expiration_ns| ts_now >= expiration_ns)
+        let reached = match ts_now.as_u64().checked_add(1) {
+            Some(next) => {
+                let later = self.expirations_pending.split_off(&UnixNanos::from(next));
+                std::mem::replace(&mut self.expirations_pending, later)
+            }
+            None => std::mem::take(&mut self.expirations_pending),
+        };
+        for instrument_id in reached.into_values().flatten() {
+            if self.expiration_reached(&instrument_id, ts_now)
+                && let Some(seq) = self.engine_seq.get(&instrument_id)
             {
+                self.expirations_due.insert(*seq, instrument_id);
+            }
+        }
+
+        let due: Vec<(u64, InstrumentId)> = self
+            .expirations_due
+            .iter()
+            .map(|(seq, instrument_id)| (*seq, *instrument_id))
+            .collect();
+        for (seq, instrument_id) in due {
+            if !self.expiration_reached(&instrument_id, ts_now) {
+                // Re-added with a later expiration (its new entry is pending), or gone.
+                self.expirations_due.remove(&seq);
+                continue;
+            }
+            let matching_engine = self
+                .matching_engines
+                .get_mut(&instrument_id)
+                .expect("due engine is registered");
+            if !matching_engine.is_expiration_settled() {
                 matching_engine.process_instrument_expiration(ts_now);
+            }
+            if matching_engine.is_expiration_settled() {
+                self.expirations_due.remove(&seq);
+            }
+        }
+    }
+
+    fn expiration_reached(&self, instrument_id: &InstrumentId, ts_now: UnixNanos) -> bool {
+        self.matching_engines
+            .get(instrument_id)
+            .and_then(|matching_engine| matching_engine.instrument.expiration_ns())
+            .is_some_and(|expiration_ns| ts_now >= expiration_ns)
+    }
+
+    fn rebuild_expiration_index(&mut self) {
+        self.expirations_pending.clear();
+        self.expirations_due.clear();
+        for (instrument_id, matching_engine) in &self.matching_engines {
+            if let Some(expiration_ns) = matching_engine.instrument.expiration_ns() {
+                self.expirations_pending
+                    .entry(expiration_ns)
+                    .or_default()
+                    .push(*instrument_id);
             }
         }
     }
@@ -1713,6 +1793,7 @@ impl SimulatedExchange {
         for matching_engine in self.matching_engines.values_mut() {
             matching_engine.reset();
         }
+        self.rebuild_expiration_index();
 
         self.pending_funding_rates.clear();
         self.funding_settlements.clear();

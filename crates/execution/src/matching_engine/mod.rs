@@ -2507,6 +2507,13 @@ impl OrderMatchingEngine {
         self.expiration_processed
     }
 
+    /// Returns whether a further `process_instrument_expiration` call is a no-op: expiration is
+    /// processed, or option settlement failed terminally (until `reset`).
+    #[must_use]
+    pub const fn is_expiration_settled(&self) -> bool {
+        self.expiration_processed || self.option_settlement_failed
+    }
+
     fn requires_pending_resolution(&self) -> bool {
         matches!(self.instrument, InstrumentAny::BinaryOption(_))
     }
