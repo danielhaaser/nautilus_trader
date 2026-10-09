@@ -433,6 +433,10 @@ impl SandboxExecutionClient {
             for (instrument_id, leverage) in &self.config.leverages {
                 margin_account.set_leverage(*instrument_id, *leverage);
             }
+
+            if let Some(model) = &self.config.margin_model {
+                margin_account.set_margin_model(model.clone());
+            }
         }
 
         self.cache.borrow_mut().update_account(&account)
