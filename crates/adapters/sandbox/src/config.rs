@@ -21,6 +21,7 @@ use nautilus_execution::{
     models::{fee::FeeModelAny, fill::FillModelAny, latency::LatencyModelAny},
 };
 use nautilus_model::{
+    accounts::margin_model::MarginModelHandle,
     enums::{AccountType, BookType, OmsType},
     identifiers::{AccountId, InstrumentId, Venue},
     types::{Currency, Money},
@@ -66,6 +67,14 @@ pub struct SandboxExecutionClientConfig {
     /// Per-instrument leverage overrides.
     #[builder(default)]
     pub leverages: AHashMap<InstrumentId, Decimal>,
+    /// The margin model for a margin account (None keeps the account's default model).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_margin_model",
+        deserialize_with = "deserialize_margin_model"
+    )]
+    pub margin_model: Option<MarginModelHandle>,
     /// The order book type for the matching engine.
     #[builder(default = BookType::L1_MBP)]
     pub book_type: BookType,
@@ -263,6 +272,35 @@ where
     }
 }
 
+fn serialize_margin_model<S>(
+    margin_model: &Option<MarginModelHandle>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match margin_model {
+        None => serializer.serialize_none(),
+        Some(_) => Err(serde::ser::Error::custom(
+            "SandboxExecutionClientConfig.margin_model is runtime-only and cannot be serialized",
+        )),
+    }
+}
+
+fn deserialize_margin_model<'de, D>(deserializer: D) -> Result<Option<MarginModelHandle>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<IgnoredAny>::deserialize(deserializer)?;
+
+    match value {
+        None => Ok(None),
+        Some(_) => Err(de::Error::custom(
+            "SandboxExecutionClientConfig.margin_model must be configured at runtime, not deserialized",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::DurationNanos;
@@ -289,6 +327,7 @@ mod tests {
         assert!(config.fee_model.is_none());
         assert!(config.fill_model.is_none());
         assert!(config.latency_model.is_none());
+        assert!(config.margin_model.is_none());
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
@@ -340,6 +379,26 @@ mod tests {
     fn test_exec_config_toml_rejects_latency_model_field() {
         let result =
             toml::from_str::<SandboxExecutionClientConfig>("latency_model = \"runtime-only\"");
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_rejects_margin_model_field() {
+        let result =
+            toml::from_str::<SandboxExecutionClientConfig>("margin_model = \"runtime-only\"");
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_rejects_serializing_runtime_margin_model() {
+        let config = SandboxExecutionClientConfig {
+            margin_model: Some(MarginModelHandle::default()),
+            ..SandboxExecutionClientConfig::default()
+        };
+
+        let result = toml::Value::try_from(&config);
 
         assert!(result.is_err());
     }

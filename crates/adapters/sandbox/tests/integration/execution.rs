@@ -53,7 +53,10 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{
+        AccountAny, MarginAccount,
+        margin_model::{MarginModel, MarginModelAny, MarginModelHandle, StandardMarginModel},
+    },
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
         AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
@@ -122,6 +125,7 @@ fn create_config(
         account_type: AccountType::Margin,
         default_leverage: Decimal::ONE,
         leverages: ahash::AHashMap::new(),
+        margin_model: None,
         book_type: BookType::L1_MBP,
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
@@ -2576,6 +2580,41 @@ async fn test_client_connect_syncs_cached_margin_account_config(
 
 #[rstest]
 #[tokio::test]
+async fn test_client_connect_installs_configured_margin_model(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.margin_model = Some(MarginModelHandle::from(MarginModelAny::Standard(
+            StandardMarginModel,
+        )));
+    });
+    setup_account_state_handler(context.cache.clone());
+
+    let mut execution_client = context.client;
+    execution_client.connect().await.unwrap();
+
+    let cache = context.cache.borrow();
+    let account = cache
+        .account(&account_id)
+        .expect("expected cached account after initial AccountState");
+
+    let AccountAny::Margin(margin) = &*account else {
+        panic!("expected margin account");
+    };
+
+    assert_eq!(margin.margin_model().name(), StandardMarginModel.name());
+    assert_ne!(
+        margin.margin_model().name(),
+        MarginModelHandle::default().name()
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_client_connect_respects_frozen_account_config(
     trader_id: TraderId,
     account_id: AccountId,
@@ -3557,6 +3596,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             account_type: AccountType::Margin,
             default_leverage: Decimal::ONE,
             leverages: ahash::AHashMap::new(),
+            margin_model: None,
             book_type: BookType::L1_MBP,
             fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
             fill_model: None,
@@ -4766,6 +4806,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         account_type: AccountType::Margin,
         default_leverage: Decimal::ONE,
         leverages: ahash::AHashMap::new(),
+        margin_model: None,
         book_type: BookType::L1_MBP,
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
