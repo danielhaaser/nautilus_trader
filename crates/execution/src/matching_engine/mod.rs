@@ -379,15 +379,11 @@ impl OrderMatchingEngine {
                     .push((book_price_raw, consumption.get(&book_price_raw).copied()));
             }
 
-            let (original_size, consumed) = consumption
+            let entry = consumption
                 .entry(book_price_raw)
                 .or_insert((level_size.raw(), 0));
-
-            // Reset consumption when book size changes (fresh data)
-            if *original_size != level_size.raw() {
-                *original_size = level_size.raw();
-                *consumed = 0;
-            }
+            Self::refresh_level_consumption(entry, level_size.raw());
+            let (original_size, consumed) = entry;
 
             let available = original_size.saturating_sub(*consumed);
             if available == 0 {
@@ -525,6 +521,19 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Brings a level's `(original_size, consumed)` entry up to the level's current size.
+    ///
+    /// A size change keeps what was already consumed: an increase adds only the increment as
+    /// fresh liquidity, and a decrease leaves at most the new size consumed. Resetting `consumed`
+    /// to zero on any change would let one resident order fill a resting order again each time
+    /// its size moves (a 100-lot bid filling a resting ask 100, then 101, then 99).
+    fn refresh_level_consumption(entry: &mut (QuantityRaw, QuantityRaw), level_size: QuantityRaw) {
+        if entry.0 != level_size {
+            entry.0 = level_size;
+            entry.1 = entry.1.min(level_size);
+        }
+    }
+
     fn consume_trade_level(
         consumption: &mut IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
         remaining: &mut QuantityRaw,
@@ -535,11 +544,7 @@ impl OrderMatchingEngine {
             .entry(level.price.value.raw())
             .or_insert((level_size, 0));
 
-        // Reconcile stale level size to prevent reset in apply_liquidity_consumption
-        if entry.0 != level_size {
-            entry.0 = level_size;
-            entry.1 = 0;
-        }
+        Self::refresh_level_consumption(entry, level_size);
 
         let available = level_size.saturating_sub(entry.1);
         let consume = min(*remaining, available);

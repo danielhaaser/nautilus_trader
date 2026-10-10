@@ -8446,7 +8446,7 @@ fn test_liquidity_consumption_tracks_fills_at_price_level(
 #[rstest]
 #[case(OrderSide::Buy, OrderSide::Sell)]
 #[case(OrderSide::Sell, OrderSide::Buy)]
-fn test_liquidity_consumption_resets_on_fresh_data(
+fn test_liquidity_consumption_size_increase_adds_only_the_increment(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
     account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
@@ -8512,7 +8512,7 @@ fn test_liquidity_consumption_resets_on_fresh_data(
         .build();
     engine_l2.process_order(&mut order1, account_id);
 
-    // Update triggers consumption reset
+    // The level grows 50 -> 80: the 50 already consumed stay consumed, 30 are fresh
     let orderbook_delta_update = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
         .book_action(BookAction::Update)
         .book_order(BookOrder::new(
@@ -8546,7 +8546,90 @@ fn test_liquidity_consumption_resets_on_fresh_data(
 
     assert_eq!(filled_events.len(), 2);
     assert_eq!(filled_events[0].last_qty, Quantity::from("50.000"));
-    assert_eq!(filled_events[1].last_qty, Quantity::from("60.000"));
+    assert_eq!(filled_events[1].last_qty, Quantity::from("30.000"));
+}
+
+/// A resident order that crosses a resting order fills it once: when the crossing level's size
+/// then moves, only an increase is fresh liquidity, and a decrease never re-opens what was
+/// consumed (a 100-lot bid must not fill a resting ask 100, then 101, then 99).
+#[rstest]
+fn test_liquidity_consumption_resting_order_crossed_by_a_growing_then_shrinking_level(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let config = OrderMatchingEngineConfig {
+        liquidity_consumption: true,
+        ..Default::default()
+    };
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+
+    let level = |side: OrderSide, price: &str, size: &str, order_id: u64, action: BookAction| {
+        OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+            .book_action(action)
+            .book_order(BookOrder::new(
+                side,
+                Price::from(price),
+                Quantity::from(size),
+                order_id,
+            ))
+            .build()
+    };
+    engine_l2
+        .process_order_book_delta(&level(
+            OrderSide::Buy,
+            "900.00",
+            "100.000",
+            1,
+            BookAction::Add,
+        ))
+        .unwrap();
+    engine_l2
+        .process_order_book_delta(&level(
+            OrderSide::Sell,
+            "1100.00",
+            "100.000",
+            2,
+            BookAction::Add,
+        ))
+        .unwrap();
+
+    let mut resting_ask = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .price(Price::from("1000.00"))
+        .quantity(Quantity::from("300.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    engine_l2.process_order(&mut resting_ask, account_id);
+    clear_order_event_handler_messages(&order_event_handler);
+
+    // A 100-lot bid arrives at the resting ask's price, then grows to 101, then shrinks to 99.
+    for (size, action) in [
+        ("100.000", BookAction::Add),
+        ("101.000", BookAction::Update),
+        ("99.000", BookAction::Update),
+    ] {
+        engine_l2
+            .process_order_book_delta(&level(OrderSide::Buy, "1000.00", size, 3, action))
+            .unwrap();
+    }
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    let filled: Vec<Quantity> = saved_messages
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill.last_qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        filled,
+        [Quantity::from("100.000"), Quantity::from("1.000")],
+        "the crossing level fills the resting ask 100, then the 1 it grew by, then nothing"
+    );
 }
 
 #[rstest]
@@ -11404,7 +11487,7 @@ fn test_trade_tick_seeds_consumption_with_stale_entry_reconciles(
         "Stop order should have triggered and filled"
     );
 
-    // Trade consumed 6 of 8 at 1000.00 → only 2 remain.
+    // The update to 8 kept the 3 already consumed; the trade consumed the 5 left at 1000.00.
     // Stop BUY qty=5 should spill to next level if consumption was correctly reconciled.
     let got_fill_at_1001 = fills.iter().any(|f| f.last_px == Price::from("1001.00"));
     assert!(
@@ -20483,12 +20566,15 @@ fn test_deferred_market_to_limit_remainder_keeps_fill_price(
         "1500.00"
     });
 
+    // At 1500.00 the 0.400 the initial fill consumed stays consumed, so the level grows to
+    // 1.000 to offer the remainder 0.600 fresh; 1501.00 is a fresh level.
+    let remainder_level = Quantity::from(if modify_remainder { "0.600" } else { "1.000" });
     let delta = OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
         .book_action(BookAction::Update)
         .book_order(BookOrder::new(
             OrderSide::Sell,
             remainder_price,
-            Quantity::from("0.600"),
+            remainder_level,
             1,
         ))
         .build();
