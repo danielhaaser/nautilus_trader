@@ -524,14 +524,18 @@ impl OrderMatchingEngine {
     /// Brings a level's `(original_size, consumed)` entry up to the level's current size.
     ///
     /// A size change keeps what was already consumed: an increase adds only the increment as
-    /// fresh liquidity, and a decrease leaves at most the new size consumed. Resetting `consumed`
-    /// to zero on any change would let one resident order fill a resting order again each time
-    /// its size moves (a 100-lot bid filling a resting ask 100, then 101, then 99).
+    /// fresh liquidity, and a decrease takes the size that left out of the consumed part first,
+    /// so it never re-opens liquidity. Resetting `consumed` to zero on any change would let one
+    /// resident order fill a resting order again each time its size moves (a 100-lot bid
+    /// filling a resting ask 100, then 101, then 99). Taking a decrease out of the consumed part
+    /// first is what a trade-seeded consumption needs: the delta that later reflects the trade
+    /// removes exactly the size the trade already consumed, and must not count it twice.
     fn refresh_level_consumption(entry: &mut (QuantityRaw, QuantityRaw), level_size: QuantityRaw) {
-        if entry.0 != level_size {
-            entry.0 = level_size;
-            entry.1 = entry.1.min(level_size);
+        let (original_size, consumed) = entry;
+        if level_size < *original_size {
+            *consumed = consumed.saturating_sub(*original_size - level_size);
         }
+        *original_size = level_size;
     }
 
     fn consume_trade_level(

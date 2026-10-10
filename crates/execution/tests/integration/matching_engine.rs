@@ -8549,6 +8549,81 @@ fn test_liquidity_consumption_size_increase_adds_only_the_increment(
     assert_eq!(filled_events[1].last_qty, Quantity::from("30.000"));
 }
 
+/// A trade seeds the consumption at its level, and the book delta that later reflects the trade
+/// removes that same size: the level keeps what is left, not what is left less the trade again.
+#[rstest]
+fn test_liquidity_consumption_delta_reflecting_a_seeded_trade_is_not_counted_twice(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+) {
+    let config = OrderMatchingEngineConfig {
+        trade_execution: true,
+        liquidity_consumption: true,
+        ..Default::default()
+    };
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+
+    let level = |side: OrderSide, size: &str, ts: u64, action: BookAction| {
+        let price = if side == OrderSide::Buy {
+            "900.00"
+        } else {
+            "1000.00"
+        };
+        OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+            .book_action(action)
+            .book_order(BookOrder::new(
+                side,
+                Price::from(price),
+                Quantity::from(size),
+                u64::from(side == OrderSide::Sell),
+            ))
+            .ts_event(UnixNanos::from(ts))
+            .build()
+    };
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Buy, "100.000", 1, BookAction::Add))
+        .unwrap();
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Sell, "100.000", 1, BookAction::Add))
+        .unwrap();
+
+    // A 40-lot buy prints at the ask, then the ask shrinks by those 40.
+    let trade = TradeTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("1000.00"),
+        Quantity::from("40.000"),
+        AggressorSide::Buy,
+        TradeId::new("1"),
+        UnixNanos::from(2u64),
+        UnixNanos::from(2u64),
+    );
+    engine_l2.process_trade_tick(&trade);
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Sell, "60.000", 3, BookAction::Update))
+        .unwrap();
+
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100.000"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    engine_l2.process_order(&mut order, account_id);
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    let filled: Vec<Quantity> = saved_messages
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill.last_qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(filled, [Quantity::from("60.000")]);
+}
+
 /// A resident order that crosses a resting order fills it once: when the crossing level's size
 /// then moves, only an increase is fresh liquidity, and a decrease never re-opens what was
 /// consumed (a 100-lot bid must not fill a resting ask 100, then 101, then 99).
@@ -11487,7 +11562,7 @@ fn test_trade_tick_seeds_consumption_with_stale_entry_reconciles(
         "Stop order should have triggered and filled"
     );
 
-    // The update to 8 kept the 3 already consumed; the trade consumed the 5 left at 1000.00.
+    // The update to 8 took 2 of the 3 consumed; the trade consumed the 7 left at 1000.00.
     // Stop BUY qty=5 should spill to next level if consumption was correctly reconciled.
     let got_fill_at_1001 = fills.iter().any(|f| f.last_px == Price::from("1001.00"));
     assert!(
