@@ -114,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_random_ids: false,
         use_reduce_only: true,
         queue_position: false,
+        book_cross_fills: true,
         liquidity_consumption: false,
         bar_adaptive_high_low_ordering: false,
         use_market_order_acks: false,

@@ -347,6 +347,10 @@ pub struct SimulatedVenueConfig {
     /// If passive fills account for queue position.
     #[builder(default = false)]
     pub queue_position: bool,
+    /// If a book update that crosses a resting limit order fills it; when `false` only trades
+    /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
+    #[builder(default = true)]
+    pub book_cross_fills: bool,
     /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,
@@ -510,6 +514,10 @@ pub struct BacktestVenueConfig {
     /// If limit order queue position tracking is enabled during trade execution.
     #[builder(default)]
     queue_position: bool,
+    /// If a book update that crosses a resting limit order fills it; when `false` only trades
+    /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
+    #[builder(default = true)]
+    book_cross_fills: bool,
     /// When OTO child orders are released relative to parent fills.
     #[builder(default)]
     oto_trigger_mode: OtoTriggerMode,
@@ -723,6 +731,11 @@ impl BacktestVenueConfig {
     #[must_use]
     pub fn queue_position(&self) -> bool {
         self.queue_position
+    }
+
+    #[must_use]
+    pub fn book_cross_fills(&self) -> bool {
+        self.book_cross_fills
     }
 
     #[must_use]

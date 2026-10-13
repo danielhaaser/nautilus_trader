@@ -313,6 +313,7 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             .allow_cash_borrowing(venue_config.allow_cash_borrowing())
             .frozen_account(venue_config.frozen_account())
             .queue_position(venue_config.queue_position())
+            .book_cross_fills(venue_config.book_cross_fills())
             .oto_full_trigger(venue_config.oto_trigger_mode() == OtoTriggerMode::Full)
             .price_protection_points(venue_config.price_protection_points())
             .liquidation_enabled(venue_config.liquidation_enabled())

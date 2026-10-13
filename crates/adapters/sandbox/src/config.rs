@@ -134,6 +134,10 @@ pub struct SandboxExecutionClientConfig {
     /// If limit order queue position tracking is enabled during trade execution.
     #[builder(default)]
     pub queue_position: bool,
+    /// If a book update that crosses a resting limit order fills it; when `false` only trades
+    /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
+    #[builder(default = true)]
+    pub book_cross_fills: bool,
     /// If order book liquidity consumption should be tracked per level.
     #[builder(default)]
     pub liquidity_consumption: bool,
@@ -176,6 +180,7 @@ impl SandboxExecutionClientConfig {
             .use_reduce_only(self.use_reduce_only)
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
+            .book_cross_fills(self.book_cross_fills)
             .oto_full_trigger(self.oto_full_trigger)
             .maybe_price_protection_points(price_protection)
             .build()
