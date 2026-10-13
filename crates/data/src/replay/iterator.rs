@@ -215,6 +215,24 @@ impl DataIterator {
         self.streams.get(&entry.priority)?.data.get(entry.index)
     }
 
+    /// Returns the name of the stream whose element [`peek`](Self::peek) returns, or `None` when
+    /// the iterator is exhausted.
+    #[must_use]
+    pub fn peek_name(&self) -> Option<&str> {
+        let priority = if let Some(p) = self.single_priority {
+            p
+        } else {
+            self.heap.peek()?.priority
+        };
+        self.names.get(&priority).map(String::as_str)
+    }
+
+    /// Returns whether a stream is registered under `name`.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.priorities.contains_key(name)
+    }
+
     /// Advances past the current replay data element, or does nothing if the iterator is
     /// exhausted.
     pub fn advance(&mut self) {
