@@ -72,7 +72,7 @@ use crate::{
     accumulator::TimeEventAccumulator,
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     data_client::BacktestDataClient,
-    data_iterator::BacktestDataIterator,
+    data_iterator::{BacktestDataIterator, DataRoute},
     exchange::{SettlementScope, SimulatedExchange},
     execution_client::BacktestExecutionClient,
     result::{
@@ -431,10 +431,32 @@ impl BacktestEngine {
     ///   `aggregation_source` is not [`AggregationSource::External`].
     pub fn add_data(
         &mut self,
+        data: Vec<Data>,
+        client_id: Option<ClientId>,
+        validate: bool,
+        sort: bool,
+    ) -> anyhow::Result<()> {
+        self.add_data_routed(data, client_id, validate, sort, DataRoute::Both)
+    }
+
+    /// Adds data to the engine for replay on `route`: the simulated exchange and the data engine
+    /// ([`DataRoute::Both`], what [`add_data`](Self::add_data) does), the exchange only, or the
+    /// data engine only.
+    ///
+    /// Streams added earlier win ties at an equal `ts_init`, so a venue replayed as an
+    /// exchange-only copy and a data-only copy reaches its exchange first when it adds that copy
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`add_data`](Self::add_data).
+    pub fn add_data_routed(
+        &mut self,
         mut data: Vec<Data>,
         client_id: Option<ClientId>,
         validate: bool,
         sort: bool,
+        route: DataRoute,
     ) -> anyhow::Result<()> {
         if sort {
             data.sort_by_key(HasTsInit::ts_init);
@@ -443,6 +465,7 @@ impl BacktestEngine {
         let stream_name =
             self.register_added_data(data.iter().map(DataRef::from), client_id, validate)?;
         self.data_iterator.add_data(&stream_name, data, true);
+        self.data_iterator.set_route(&stream_name, route);
         self.sorted = sort;
 
         Ok(())
@@ -464,12 +487,30 @@ impl BacktestEngine {
         validate: bool,
         sort: bool,
     ) -> anyhow::Result<()> {
+        self.add_data_batch_routed(data, client_id, validate, sort, DataRoute::Both)
+    }
+
+    /// Adds a typed data batch to the engine for replay on `route` (see
+    /// [`add_data_routed`](Self::add_data_routed)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`add_data`](Self::add_data).
+    pub fn add_data_batch_routed(
+        &mut self,
+        data: DataBatch,
+        client_id: Option<ClientId>,
+        validate: bool,
+        sort: bool,
+        route: DataRoute,
+    ) -> anyhow::Result<()> {
         let stream_name = self.register_added_data(
             (0..data.len()).filter_map(|index| data.get(index)),
             client_id,
             validate,
         )?;
         self.data_iterator.add_data_batch(&stream_name, data, true);
+        self.data_iterator.set_route(&stream_name, route);
         self.sorted = sort;
 
         Ok(())
@@ -934,17 +975,22 @@ impl BacktestEngine {
             }
 
             let settlement_scope = {
+                let route = self.data_iterator.peek_route();
                 let Some(data) = self.data_iterator.peek() else {
                     continue;
                 };
                 let settlement_scope = Self::settlement_scope(data);
-                Self::route_data_to_exchange(
-                    &self.venues,
-                    &mut self.has_book_processed,
-                    &self.kernel.clock,
-                    data,
-                )?;
-                self.kernel.data_engine.borrow_mut().process_data_ref(data);
+                if route.to_exchange() {
+                    Self::route_data_to_exchange(
+                        &self.venues,
+                        &mut self.has_book_processed,
+                        &self.kernel.clock,
+                        data,
+                    )?;
+                }
+                if route.to_data_engine() {
+                    self.kernel.data_engine.borrow_mut().process_data_ref(data);
+                }
                 settlement_scope
             };
             self.data_iterator.advance();
@@ -2907,6 +2953,83 @@ mod tests {
 
     fn send_execution_command(command: TradingCommand) {
         msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), command);
+    }
+
+    #[rstest]
+    #[case(DataRoute::Both, 1, DataRoute::Both, 2, "1001.00", 2)]
+    #[case(DataRoute::ExchangeOnly, 1, DataRoute::DataOnly, 2, "1000.00", 1)]
+    #[case(DataRoute::DataOnly, 2, DataRoute::ExchangeOnly, 1, "1001.00", 1)]
+    fn test_routed_streams_reach_only_their_destination(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+        #[case] first_route: DataRoute,
+        #[case] first_ts: u64,
+        #[case] second_route: DataRoute,
+        #[case] second_ts: u64,
+        #[case] exchange_bid: &str,
+        #[case] cached_quotes: usize,
+    ) {
+        let mut engine = create_engine();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let instrument_id = instrument.id();
+        engine.add_instrument(&instrument).unwrap();
+        let quote = |bid: &str, ask: &str, ts: u64| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from(bid),
+                Price::from(ask),
+                Quantity::from("1.000"),
+                Quantity::from("1.000"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        };
+        engine
+            .add_data_routed(
+                vec![quote("1000.00", "1002.00", first_ts)],
+                None,
+                true,
+                true,
+                first_route,
+            )
+            .unwrap();
+        engine
+            .add_data_batch_routed(
+                DataBatch::from(vec![QuoteTick::new(
+                    instrument_id,
+                    Price::from("1001.00"),
+                    Price::from("1002.00"),
+                    Quantity::from("1.000"),
+                    Quantity::from("1.000"),
+                    UnixNanos::from(second_ts),
+                    UnixNanos::from(second_ts),
+                )]),
+                None,
+                true,
+                true,
+                second_route,
+            )
+            .unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+
+        // The exchange's book holds the latest quote routed to it (a later quote routed elsewhere
+        // never reaches it); the data engine cached only the quotes routed to it. Every item still advances the clock and counts an iteration.
+        assert_eq!(
+            engine.venues[&instrument_id.venue]
+                .borrow()
+                .best_bid_price(instrument_id),
+            Some(Price::from(exchange_bid))
+        );
+        assert_eq!(
+            engine
+                .kernel
+                .cache
+                .borrow()
+                .quotes(&instrument_id)
+                .map_or(0, |quotes| quotes.len()),
+            cached_quotes
+        );
+        assert_eq!(engine.get_result().iterations, 2);
     }
 
     #[rstest]
