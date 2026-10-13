@@ -8707,6 +8707,103 @@ fn test_liquidity_consumption_resting_order_crossed_by_a_growing_then_shrinking_
     );
 }
 
+/// `book_cross_fills`: a book update that crosses a resting order fills it only when the switch
+/// is on (the default). Off, the order stays resting through the cross, a trade on its own side
+/// that cannot reach it (a seller hitting the bid) leaves it alone, and a buyer lifting at its
+/// price fills it — only trades fill a resting order.
+#[rstest]
+#[case(true, true)]
+#[case(false, true)]
+#[case(false, false)]
+fn test_book_cross_fills_switch_leaves_a_crossed_resting_order_to_the_trades(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] book_cross_fills: bool,
+    #[case] liquidity_consumption: bool,
+) {
+    let config = OrderMatchingEngineConfig {
+        liquidity_consumption,
+        queue_position: true,
+        book_cross_fills,
+        ..Default::default()
+    };
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+
+    let level = |side: OrderSide, price: &str, size: &str, order_id: u64| {
+        OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+            .book_action(BookAction::Add)
+            .book_order(BookOrder::new(
+                side,
+                Price::from(price),
+                Quantity::from(size),
+                order_id,
+            ))
+            .build()
+    };
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Buy, "900.00", "100.000", 1))
+        .unwrap();
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Sell, "1100.00", "100.000", 2))
+        .unwrap();
+
+    let mut resting_ask = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .price(Price::from("1000.00"))
+        .quantity(Quantity::from("300.000"))
+        .post_only(true)
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    engine_l2.process_order(&mut resting_ask, account_id);
+    clear_order_event_handler_messages(&order_event_handler);
+
+    let fills = |handler: &TypedIntoMessageSavingHandler<OrderEventAny>| -> Vec<Quantity> {
+        get_order_event_handler_messages(handler)
+            .iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill.last_qty),
+                _ => None,
+            })
+            .collect()
+    };
+    let trade = |price: &str, size: &str, aggressor: AggressorSide, id: &str, ts: u64| {
+        TradeTick::new(
+            instrument_eth_usdt.id(),
+            Price::from(price),
+            Quantity::from(size),
+            aggressor,
+            TradeId::new(id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+
+    // A 100-lot bid rests at the ask's price: a book cross, no trade.
+    engine_l2
+        .process_order_book_delta(&level(OrderSide::Buy, "1000.00", "100.000", 3))
+        .unwrap();
+    if book_cross_fills {
+        assert_eq!(fills(&order_event_handler), [Quantity::from("100.000")]);
+        return;
+    }
+    assert!(fills(&order_event_handler).is_empty(), "no trade, no fill");
+
+    // A seller hitting the crossing bid prints at the ask's price but is no buyer of it.
+    engine_l2.process_trade_tick(&trade("1000.00", "20.000", AggressorSide::Sell, "T-1", 2));
+    assert!(
+        fills(&order_event_handler).is_empty(),
+        "a sell print cannot fill an ask"
+    );
+
+    // A buyer lifting at the ask's price fills it, as much as it printed.
+    engine_l2.process_trade_tick(&trade("1000.00", "40.000", AggressorSide::Buy, "T-2", 3));
+    assert_eq!(fills(&order_event_handler), [Quantity::from("40.000")]);
+}
+
 #[rstest]
 #[case(OrderSide::Buy)]
 #[case(OrderSide::Sell)]

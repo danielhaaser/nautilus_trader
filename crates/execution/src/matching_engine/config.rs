@@ -49,6 +49,14 @@ pub struct OrderMatchingEngineConfig {
     pub use_market_order_acks: bool,
     #[builder(default)]
     pub queue_position: bool,
+    /// If a book update that crosses a resting limit order fills it. When `false`, a resting
+    /// limit fills only while a trade tick is processed, and only when that trade could fill it
+    /// (a seller, or no aggressor, at or below a bid's limit; a buyer, or none, at or above an
+    /// ask's): a book that moves through its price with no trade leaves it resting, its queue
+    /// position updated as the book changes. Fills on arrival (a marketable new or modified
+    /// order) are unaffected.
+    #[builder(default = true)]
+    pub book_cross_fills: bool,
     #[builder(default)]
     pub oto_full_trigger: bool,
     #[builder(default)]
@@ -74,6 +82,7 @@ mod tests {
         assert!(config.bar_execution);
         assert!(!config.bar_adaptive_high_low_ordering);
         assert!(config.trade_execution);
+        assert!(config.book_cross_fills);
         assert!(!config.liquidity_consumption);
         assert!(config.reject_stop_orders);
         assert!(config.support_gtd_orders);

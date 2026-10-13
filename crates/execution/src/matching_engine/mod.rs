@@ -4193,7 +4193,9 @@ impl OrderMatchingEngine {
             // Process bid actions before snapshotting asks so cross-side
             // contingencies (OCO/OUO) mutate state between sides
             for action in self.core.iterate_bids() {
-                if !self.should_process_match_action(action, match_mode) {
+                if !self.should_process_match_action(action, match_mode)
+                    || self.book_cross_withheld(action, aggressor_side)
+                {
                     continue;
                 }
 
@@ -4206,7 +4208,9 @@ impl OrderMatchingEngine {
             }
 
             for action in self.core.iterate_asks() {
-                if !self.should_process_match_action(action, match_mode) {
+                if !self.should_process_match_action(action, match_mode)
+                    || self.book_cross_withheld(action, aggressor_side)
+                {
                     continue;
                 }
 
@@ -4342,6 +4346,33 @@ impl OrderMatchingEngine {
             order.set_liquidity_side(LiquiditySide::Maker);
         }
         self.fill_limit_order(client_order_id);
+    }
+
+    /// Whether a resting limit order's fill is withheld because no trade made it
+    /// (`book_cross_fills = false`): outside trade processing every resting limit fill is a book
+    /// cross; inside it, only a trade that could fill the order's side at its limit counts —
+    /// a seller (or no aggressor) at or below a bid's limit, a buyer (or none) at or above an
+    /// ask's. Stops and every fill with `book_cross_fills` on are never withheld.
+    fn book_cross_withheld(&self, action: MatchAction, aggressor_side: AggressorSide) -> bool {
+        if self.config.book_cross_fills {
+            return false;
+        }
+        let MatchAction::FillLimit(client_order_id) = action else {
+            return false;
+        };
+        let Some(order) = self.core.get_order(client_order_id) else {
+            return false;
+        };
+        let (Some(_), Some(last), Some(limit)) =
+            (self.last_trade_size, self.core.last, order.limit_price)
+        else {
+            return true;
+        };
+        let reaches = match order.order_side {
+            OrderSide::Buy => aggressor_side != AggressorSide::Buy && last <= limit,
+            OrderSide::Sell => aggressor_side != AggressorSide::Sell && last >= limit,
+        };
+        !reaches
     }
 
     fn should_process_match_action(&self, action: MatchAction, match_mode: OrderMatchMode) -> bool {
