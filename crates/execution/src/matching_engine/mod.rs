@@ -167,6 +167,20 @@ impl Debug for OrderMatchingEngine {
     }
 }
 
+/// What a later [`OrderMatchingEngine::iterate`] with no aggressor would do to an engine that
+/// nothing mutates in between, as [`OrderMatchingEngine::iterate_work`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterateWork {
+    /// The next iterate may change the engine or emit events: it holds orders, post-match or
+    /// purge work, a price override or close, or a reached expiration that is not yet settled.
+    Pending,
+    /// Every later iterate is a no-op, whatever its timestamp.
+    Idle,
+    /// Every later iterate before this instant is a no-op; one at or after it reaches the
+    /// instrument's unprocessed expiration.
+    IdleUntil(UnixNanos),
+}
+
 impl OrderMatchingEngine {
     /// Creates a new [`OrderMatchingEngine`] instance.
     #[expect(clippy::too_many_arguments)]
@@ -2603,6 +2617,61 @@ impl OrderMatchingEngine {
     #[must_use]
     pub const fn is_expiration_settled(&self) -> bool {
         self.expiration_processed || self.option_settlement_failed
+    }
+
+    /// Returns what a later [`Self::iterate`] with no aggressor would do if nothing mutates the
+    /// engine first, judged at `ts_now` (the instant of the iterate that just ran).
+    ///
+    /// [`IterateWork::Idle`] (or [`IterateWork::IdleUntil`] before its instant) means such an
+    /// iterate changes no state, emits no event, logs nothing and draws no fill-model random
+    /// number, so a caller may skip it:
+    /// - no order rests in the core and no post-match order is tracked, so the bid and ask
+    ///   passes yield no action and the per-order pass visits nothing;
+    /// - no bid/ask/last override is pending, and the core's bid and ask already equal the book's
+    ///   best prices (raw value and precision), so the opening refresh (either book type) and the
+    ///   closing restore assign what is already there;
+    /// - the four purge collections are empty, so the purges remove nothing;
+    /// - no instrument close is held, and the expiration check returns before acting: expiration
+    ///   processed, option settlement failed, the expiration not yet reached (`IdleUntil`), or a
+    ///   binary option already pending resolution (re-entering it returns at once).
+    #[must_use]
+    pub fn iterate_work(&self, ts_now: UnixNanos) -> IterateWork {
+        let same_price = |core: Option<Price>, book: Option<Price>| match (core, book) {
+            (None, None) => true,
+            (Some(core), Some(book)) => {
+                core.raw() == book.raw() && core.precision == book.precision
+            }
+            _ => false,
+        };
+        let quiet = self.core.iter_orders().next().is_none()
+            && self.post_match_order_ids.is_empty()
+            && self.target_bid.is_none()
+            && self.target_ask.is_none()
+            && self.target_last.is_none()
+            && self.cached_filled_qty.is_empty()
+            && self.pending_order_updates.borrow().is_empty()
+            && self.rejected_oto_parent_ids.borrow().is_empty()
+            && self.pending_fills.is_empty()
+            && self.instrument_close.is_none()
+            && same_price(self.core.bid, self.book.best_bid_price())
+            && same_price(self.core.ask, self.book.best_ask_price());
+
+        if !quiet {
+            return IterateWork::Pending;
+        }
+
+        if self.expiration_processed || self.option_settlement_failed {
+            return IterateWork::Idle;
+        }
+
+        match self.instrument.expiration_ns() {
+            None => IterateWork::Idle,
+            Some(expiration_ns) if ts_now < expiration_ns => IterateWork::IdleUntil(expiration_ns),
+            Some(_) if self.pending_resolution && self.requires_pending_resolution() => {
+                IterateWork::Idle
+            }
+            Some(_) => IterateWork::Pending,
+        }
     }
 
     fn requires_pending_resolution(&self) -> bool {
@@ -12578,5 +12647,187 @@ mod tests {
 
         assert!(rested >= 5, "replay must exercise resting orders");
         assert!(trades >= 50, "replay must exercise trade interleavings");
+    }
+
+    /// An engine on `instrument` whose events are collected rather than sent.
+    fn iterate_work_engine(
+        instrument: InstrumentAny,
+    ) -> (OrderMatchingEngine, Rc<RefCell<Vec<OrderEventAny>>>) {
+        let mut engine = OrderMatchingEngine::new(
+            instrument,
+            1,
+            FillModelHandle::default(),
+            FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into(),
+            BookType::L1_MBP,
+            OmsType::Netting,
+            AccountType::Margin,
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::new(RefCell::new(Cache::default())),
+            Default::default(),
+        );
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&events);
+        engine.set_event_handler(Rc::new(move |event| sink.borrow_mut().push(event)));
+        (engine, events)
+    }
+
+    /// Everything an iterate can change: the core (prices and orders), the book, the market and
+    /// expiration state, the overrides and the purge and post-match collections.
+    fn iterate_snapshot(engine: &OrderMatchingEngine) -> String {
+        format!(
+            "{:?} | {:?} | {:?} {:?} {:?} {:?} {:?} | {} {} {} {} | {:?} {:?} {:?} {:?} {:?}",
+            engine.core,
+            engine.book,
+            engine.market_status,
+            engine.target_bid,
+            engine.target_ask,
+            engine.target_last,
+            engine.instrument_close,
+            engine.expiration_processed,
+            engine.pending_resolution,
+            engine.option_settlement_failed,
+            engine.option_expiration_orders_canceled,
+            engine.cached_filled_qty,
+            engine.pending_order_updates.borrow(),
+            engine.pending_fills.keys().collect::<Vec<_>>(),
+            engine.post_match_order_ids,
+            engine.rejected_oto_parent_ids.borrow(),
+        )
+    }
+
+    #[rstest]
+    fn test_iterate_work_idle_engine_iterates_to_no_effect() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let (mut engine, events) = iterate_work_engine(instrument.clone());
+        engine.process_quote_tick(&QuoteTick::new(
+            instrument.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("10.000"),
+            Quantity::from("10.000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        engine.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+        assert_eq!(
+            engine.iterate_work(UnixNanos::from(1)),
+            super::IterateWork::Idle
+        );
+
+        let before = iterate_snapshot(&engine);
+        let events_before = events.borrow().len();
+        for ts in [2, 1_000, u64::MAX - 1] {
+            engine.iterate(UnixNanos::from(ts), AggressorSide::NoAggressor);
+            assert_eq!(iterate_snapshot(&engine), before, "iterate at {ts}");
+            assert_eq!(
+                engine.iterate_work(UnixNanos::from(ts)),
+                super::IterateWork::Idle
+            );
+        }
+        assert_eq!(events.borrow().len(), events_before);
+    }
+
+    #[rstest]
+    fn test_iterate_work_pending_with_a_resting_order_or_a_stale_touch() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let (mut engine, _events) = iterate_work_engine(instrument.clone());
+        engine.process_quote_tick(&QuoteTick::new(
+            instrument.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("10.000"),
+            Quantity::from("10.000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        engine.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+
+        // A core touch the book no longer shows is work: the iterate restores it
+        engine.core.bid = Some(Price::from("999.00"));
+        assert_eq!(
+            engine.iterate_work(UnixNanos::from(1)),
+            super::IterateWork::Pending
+        );
+        engine.iterate(UnixNanos::from(2), AggressorSide::NoAggressor);
+        assert_eq!(engine.core.bid, Some(Price::from("1000.00")));
+        assert_eq!(
+            engine.iterate_work(UnixNanos::from(2)),
+            super::IterateWork::Idle
+        );
+
+        // A resting order is work
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .price(Price::from("999.00"))
+            .quantity(Quantity::from("1.000"))
+            .submit(true)
+            .build();
+        process_cached_order(&mut engine, &mut order, AccountId::from("SIM-001"));
+        engine.iterate(UnixNanos::from(3), AggressorSide::NoAggressor);
+        assert!(engine.order_exists(order.client_order_id()));
+        assert_eq!(
+            engine.iterate_work(UnixNanos::from(3)),
+            super::IterateWork::Pending
+        );
+    }
+
+    #[rstest]
+    fn test_iterate_work_idle_until_expiration_then_idle_pending_resolution() {
+        let instrument =
+            InstrumentAny::BinaryOption(nautilus_model::instruments::stubs::binary_option());
+        let expiration_ns = instrument.expiration_ns().unwrap();
+        let (mut engine, events) = iterate_work_engine(instrument.clone());
+        engine.process_quote_tick(&QuoteTick::new(
+            instrument.id(),
+            Price::from("0.400"),
+            Price::from("0.600"),
+            Quantity::from("10.00"),
+            Quantity::from("10.00"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        engine.iterate(UnixNanos::from(1), AggressorSide::NoAggressor);
+        assert_eq!(
+            engine.iterate_work(UnixNanos::from(1)),
+            super::IterateWork::IdleUntil(expiration_ns)
+        );
+
+        // Before the expiration an iterate is a no-op
+        let before = iterate_snapshot(&engine);
+        engine.iterate(
+            UnixNanos::from(expiration_ns.as_u64() - 1),
+            AggressorSide::NoAggressor,
+        );
+        assert_eq!(iterate_snapshot(&engine), before);
+
+        // At it the binary option enters pending resolution, after which iterates are no-ops
+        engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+        assert_ne!(iterate_snapshot(&engine), before);
+        assert!(engine.pending_resolution);
+        assert_eq!(
+            engine.market_status,
+            nautilus_model::enums::MarketStatus::Closed
+        );
+        assert_eq!(engine.iterate_work(expiration_ns), super::IterateWork::Idle);
+        let pending = iterate_snapshot(&engine);
+        let events_pending = events.borrow().len();
+        engine.iterate(
+            UnixNanos::from(expiration_ns.as_u64() + 1),
+            AggressorSide::NoAggressor,
+        );
+        assert_eq!(iterate_snapshot(&engine), pending);
+        assert_eq!(events.borrow().len(), events_pending);
+
+        // The close settles it
+        engine.process_instrument_close(nautilus_model::data::InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            nautilus_model::enums::InstrumentCloseType::ContractExpired,
+            expiration_ns,
+            expiration_ns,
+        ));
+        assert!(engine.is_expiration_processed());
+        assert_eq!(engine.iterate_work(expiration_ns), super::IterateWork::Idle);
     }
 }

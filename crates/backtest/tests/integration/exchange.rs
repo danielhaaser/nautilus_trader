@@ -5253,3 +5253,326 @@ fn test_remove_settled_instruments_keeps_unsettled_engines(
     assert_eq!(exchange.borrow_mut().remove_settled_instruments(), 0);
     assert_eq!(exchange.borrow().get_matching_engines().len(), 1);
 }
+
+/// A binary option on the `KALSHI` venue, expiring at `expiration_ns`.
+fn walk_binary(symbol: &str, expiration_ns: u64) -> InstrumentAny {
+    InstrumentAny::BinaryOption(
+        nautilus_model::instruments::BinaryOption::builder()
+            .instrument_id(InstrumentId::from(format!("{symbol}.KALSHI").as_str()))
+            .raw_symbol(Symbol::from(symbol))
+            .asset_class(AssetClass::Alternative)
+            .currency(Currency::USD())
+            .activation_ns(UnixNanos::default())
+            .expiration_ns(UnixNanos::from(expiration_ns))
+            .price_precision(2)
+            .size_precision(0)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("1"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap(),
+    )
+}
+
+/// `text` with every UUID (8-4-4-4-12 hex) blanked, so two runs' events compare.
+fn strip_uuids(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let is_uuid = |at: usize| {
+        bytes.len() >= at + 36
+            && bytes[at..at + 36].iter().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => *b == b'-',
+                _ => b.is_ascii_hexdigit(),
+            })
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if is_uuid(at) {
+            out.push_str("<uuid>");
+            at += 36;
+        } else {
+            let ch = text[at..].chars().next().unwrap();
+            out.push(ch);
+            at += ch.len_utf8();
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineWalk {
+    /// `iterate_matching_engines`: only engines with work.
+    Skipping,
+    /// `iterate_every_matching_engine`: the pin's walk over every engine.
+    Every,
+}
+
+/// One scripted exchange whose order events are logged and applied to its cache (as the
+/// execution engine applies them), with every matching engine's state logged after each walk.
+struct WalkScript {
+    exchange: Rc<RefCell<SimulatedExchange>>,
+    cache: Rc<RefCell<Cache>>,
+    log: Rc<RefCell<Vec<String>>>,
+    walk: EngineWalk,
+    /// The engines awake before each walk, by walk instant.
+    awake: Vec<(u64, Vec<String>)>,
+}
+
+impl WalkScript {
+    fn new(walk: EngineWalk, instruments: &[InstrumentAny]) -> Self {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let exchange = get_exchange(
+            Venue::new("KALSHI"),
+            AccountType::Cash,
+            BookType::L1_MBP,
+            Some(cache.clone()),
+        );
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let handler = {
+            let log = Rc::clone(&log);
+            let cache = Rc::clone(&cache);
+            nautilus_common::msgbus::typed_handler::TypedIntoHandler::from(
+                move |event: OrderEventAny| {
+                    log.borrow_mut()
+                        .push(format!("event {}", strip_uuids(&format!("{event:?}"))));
+                    let _ = cache.borrow_mut().update_order(&event);
+                },
+            )
+        };
+        msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
+        for instrument in instruments {
+            exchange
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+        }
+        Self {
+            exchange,
+            cache,
+            log,
+            walk,
+            awake: Vec::new(),
+        }
+    }
+
+    fn quote(&self, symbol: &str, bid: &str, ask: &str, ts: u64) {
+        self.exchange
+            .borrow_mut()
+            .process_quote_tick(&QuoteTick::new(
+                InstrumentId::from(format!("{symbol}.KALSHI").as_str()),
+                Price::from(bid),
+                Price::from(ask),
+                Quantity::from("100"),
+                Quantity::from("100"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+            .unwrap();
+    }
+
+    fn limit(&self, symbol: &str, id: &str, side: OrderSide, price: &str, ts: u64) {
+        let order = matching_option_limit_order(
+            InstrumentId::from(format!("{symbol}.KALSHI").as_str()),
+            ClientOrderId::new(id),
+            side,
+            Quantity::from("5"),
+            Price::from(price),
+        );
+        submit_matching_option_limit(&self.exchange, &self.cache, &order, UnixNanos::from(ts));
+    }
+
+    fn cancel(&self, symbol: &str, id: &str, ts: u64) {
+        let command =
+            TradingCommand::CancelOrder(nautilus_common::messages::execution::CancelOrder::new(
+                TraderId::test_default(),
+                None,
+                StrategyId::test_default(),
+                InstrumentId::from(format!("{symbol}.KALSHI").as_str()),
+                ClientOrderId::new(id),
+                None,
+                UUID4::default(),
+                UnixNanos::from(ts),
+                None,
+                None,
+            ));
+        self.exchange.borrow_mut().send(command);
+        self.exchange.borrow_mut().process(UnixNanos::from(ts));
+    }
+
+    fn walk(&mut self, ts: u64) {
+        let awake = self
+            .exchange
+            .borrow()
+            .get_matching_engines()
+            .awake_instrument_ids()
+            .iter()
+            .map(|id| id.symbol.to_string())
+            .collect();
+        self.awake.push((ts, awake));
+        match self.walk {
+            EngineWalk::Skipping => self
+                .exchange
+                .borrow_mut()
+                .iterate_matching_engines(UnixNanos::from(ts)),
+            EngineWalk::Every => self
+                .exchange
+                .borrow_mut()
+                .iterate_every_matching_engine(UnixNanos::from(ts)),
+        }
+
+        let exchange = self.exchange.borrow();
+        let mut log = self.log.borrow_mut();
+        for (instrument_id, engine) in exchange.get_matching_engines().iter() {
+            let core = engine.get_core();
+            log.push(format!(
+                "walk {ts} {instrument_id}: core {:?}/{:?}/{:?} book {:?}/{:?} orders {:?} \
+                 filled_qty {} status {:?} expired {} settled {}",
+                core.bid,
+                core.ask,
+                core.last,
+                engine.best_bid_price(),
+                engine.best_ask_price(),
+                engine.get_open_orders(),
+                engine.cached_filled_qty_len(),
+                engine.market_status,
+                engine.is_expiration_processed(),
+                engine.is_expiration_settled(),
+            ));
+        }
+        let cache = self.cache.borrow();
+        let mut orders: Vec<String> = cache
+            .orders(None, None, None, None, None)
+            .iter()
+            .map(|order| {
+                format!(
+                    "walk {ts} order {} {:?} filled {} leaves {} venue {:?}",
+                    order.client_order_id(),
+                    order.status(),
+                    order.filled_qty(),
+                    order.leaves_qty(),
+                    order.venue_order_id(),
+                )
+            })
+            .collect();
+        orders.sort();
+        log.extend(orders);
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+/// Plays one script: four binary options, quotes, a resting order filled by a later quote, an
+/// order cancelled, a rejected short, two expirations (one with nothing else touching its
+/// engine, so only an alarm wakes it), a close, and an order sent to a closed market.
+fn play_walk_script(walk: EngineWalk) -> WalkScript {
+    let instruments = [
+        walk_binary("A", 10_000),
+        walk_binary("B", 1_000),
+        walk_binary("C", 5_000),
+        walk_binary("D", 1_000_000),
+    ];
+    let mut script = WalkScript::new(walk, &instruments);
+    for symbol in ["A", "B", "C", "D"] {
+        script.quote(symbol, "0.40", "0.60", 1);
+    }
+    script.walk(1);
+
+    script.limit("A", "O-A-1", OrderSide::Buy, "0.45", 2);
+    script.walk(2);
+
+    script.quote("C", "0.41", "0.59", 3);
+    script.walk(3);
+
+    // The ask comes down through the resting bid
+    script.quote("A", "0.40", "0.44", 4);
+    script.walk(4);
+
+    script.limit("D", "O-D-1", OrderSide::Sell, "0.70", 5);
+    script.limit("C", "O-C-1", OrderSide::Buy, "0.42", 6);
+    script.walk(6);
+    script.cancel("C", "O-C-1", 7);
+    script.walk(7);
+
+    // B expires with no close yet: pending resolution, its market closed
+    script.walk(1_000);
+
+    let b = InstrumentId::from("B.KALSHI");
+    script
+        .exchange
+        .borrow_mut()
+        .process_instrument_close(InstrumentClose::new(
+            b,
+            Price::from("1.00"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(1_001),
+            UnixNanos::from(1_001),
+        ))
+        .unwrap();
+    script
+        .exchange
+        .borrow_mut()
+        .process_instrument_expirations(UnixNanos::from(1_001));
+    script.walk(1_001);
+
+    // C expires: nothing has touched its engine since its last walk
+    script.walk(5_000);
+
+    script.limit("C", "O-C-2", OrderSide::Buy, "0.50", 5_001);
+    script.walk(5_001);
+
+    script.quote("A", "0.45", "0.47", 6_000);
+    script.walk(6_000);
+    script
+}
+
+/// After an order the exchange iterates only the engines with work, and every engine's state,
+/// every order event and every cached order are what the pin's walk over every engine gives.
+#[rstest]
+fn test_iterate_matching_engines_skips_idle_engines_with_identical_results() {
+    let every = play_walk_script(EngineWalk::Every);
+    let skipping = play_walk_script(EngineWalk::Skipping);
+
+    let expected = every.log();
+    let actual = skipping.log();
+    assert_eq!(actual.len(), expected.len());
+    for (line, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(actual, expected, "log line {line}");
+    }
+
+    // The script exercises what it claims to
+    let has = |needle: &str| expected.iter().any(|line| line.contains(needle));
+    assert!(has("event Filled"), "{expected:#?}");
+    assert!(has("event Canceled"), "{expected:#?}");
+    assert!(has("event Rejected"), "{expected:#?}");
+    assert!(has("walk 1000 B.KALSHI") && has("status Closed expired false"));
+    assert!(
+        expected
+            .iter()
+            .any(|line| line.starts_with("walk 5000 C.KALSHI") && line.contains("status Closed")),
+        "{expected:#?}"
+    );
+
+    // Engines without work were not visited: none after the opening quotes, only A's resting
+    // order after its submit, C again only for the walk after its quote, and C's expiration
+    // reached by its alarm alone
+    let awake = |ts: u64| {
+        skipping
+            .awake
+            .iter()
+            .find(|(at, _)| *at == ts)
+            .map(|(_, awake)| awake.clone())
+            .unwrap()
+    };
+    assert_eq!(awake(1), ["A", "B", "C", "D"]);
+    assert_eq!(awake(2), ["A"]);
+    assert_eq!(awake(3), ["A", "C"]);
+    assert!(
+        !awake(5_000).contains(&"C".to_string()),
+        "{:?}",
+        awake(5_000)
+    );
+    assert_eq!(every.awake.len(), skipping.awake.len());
+}
