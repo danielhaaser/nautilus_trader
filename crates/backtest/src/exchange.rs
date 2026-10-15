@@ -38,7 +38,8 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{
-        OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
+        IterateWork, OrderMatchingEngine, config::OrderMatchingEngineConfig,
+        inflight::InflightOrders,
     },
     models::{
         fee::FeeModelHandle,
@@ -224,10 +225,24 @@ pub struct SimulatedExchange {
 /// ([`SimulatedExchange::remove_settled_instruments`]); its slot stays, so the instrument keeps
 /// its position in the engine order if its engine is rebuilt or the instrument is re-added.
 /// Engines are boxed so a removed engine's memory is released.
+///
+/// The container also knows which engines [`Self::iterate`] must visit. An engine is **awake**
+/// from any mutable access (or its insertion) until an iterate leaves it with no work
+/// ([`OrderMatchingEngine::iterate_work`]); a sleeping engine whose instrument has an
+/// unprocessed expiration keeps an alarm at that instant, which wakes it for the first iterate
+/// that reaches it. Mutable access goes only through this type, so a sleeping engine is exactly as
+/// its last iterate left it, and iterating it again would be a no-op.
 #[derive(Debug, Default)]
 pub struct MatchingEngines {
     slots: IndexMap<InstrumentId, Option<Box<OrderMatchingEngine>>>,
     live: usize,
+    /// Per slot index: whether the engine is awake (listed in `awake_slots`).
+    awake: Vec<bool>,
+    /// The awake slot indices, unordered.
+    awake_slots: Vec<usize>,
+    /// Sleeping engines' wake-up instants, `(expiration, slot index)`. An entry can be stale (the
+    /// engine woke meanwhile); a stale one only wakes an engine whose iterate is then a no-op.
+    alarms: BTreeSet<(UnixNanos, usize)>,
 }
 
 impl MatchingEngines {
@@ -237,10 +252,12 @@ impl MatchingEngines {
         self.slots.get(instrument_id).and_then(Option::as_deref)
     }
 
+    /// Returns the engine for `instrument_id` to mutate, waking it.
     fn get_mut(&mut self, instrument_id: &InstrumentId) -> Option<&mut OrderMatchingEngine> {
-        self.slots
-            .get_mut(instrument_id)
-            .and_then(Option::as_deref_mut)
+        let (index, _, slot) = self.slots.get_full_mut(instrument_id)?;
+        let engine = slot.as_deref_mut()?;
+        wake(&mut self.awake, &mut self.awake_slots, index);
+        Some(engine)
     }
 
     /// Returns whether an engine is registered (and not removed) for `instrument_id`.
@@ -278,17 +295,82 @@ impl MatchingEngines {
         self.slots.values().filter_map(Option::as_deref)
     }
 
+    /// Iterates every engine to mutate, in registration order, waking them all.
     fn values_mut(&mut self) -> impl Iterator<Item = &mut OrderMatchingEngine> {
+        for index in 0..self.slots.len() {
+            wake(&mut self.awake, &mut self.awake_slots, index);
+        }
         self.slots.values_mut().filter_map(Option::as_deref_mut)
     }
 
     fn insert(&mut self, instrument_id: InstrumentId, engine: OrderMatchingEngine) {
-        if !matches!(
-            self.slots.insert(instrument_id, Some(Box::new(engine))),
-            Some(Some(_))
-        ) {
+        let (index, previous) = self
+            .slots
+            .insert_full(instrument_id, Some(Box::new(engine)));
+        if !matches!(previous, Some(Some(_))) {
             self.live += 1;
         }
+        wake(&mut self.awake, &mut self.awake_slots, index);
+    }
+
+    /// Iterates, in registration order, every engine whose iterate at `ts_now` could do anything:
+    /// the awake ones and those whose alarm `ts_now` has reached. The others are asleep (no
+    /// mutable access since an iterate left them with no work), so the iterate skipped for each is
+    /// a no-op ([`OrderMatchingEngine::iterate_work`]). A visited engine goes back to sleep when
+    /// its iterate leaves it with no work.
+    fn iterate(&mut self, ts_now: UnixNanos) {
+        while let Some(&(alarm_ns, index)) = self.alarms.first() {
+            if alarm_ns > ts_now {
+                break;
+            }
+            self.alarms.pop_first();
+            wake(&mut self.awake, &mut self.awake_slots, index);
+        }
+
+        let mut visit = std::mem::take(&mut self.awake_slots);
+        visit.sort_unstable();
+        for &index in &visit {
+            let work = match self.slots.get_index_mut(index) {
+                Some((_, Some(engine))) => {
+                    engine.iterate(ts_now, AggressorSide::NoAggressor);
+                    engine.iterate_work(ts_now)
+                }
+                // Removed since it woke; a rebuilt engine wakes on insertion.
+                _ => IterateWork::Idle,
+            };
+            match work {
+                IterateWork::Pending => self.awake_slots.push(index),
+                IterateWork::Idle => self.awake[index] = false,
+                IterateWork::IdleUntil(alarm_ns) => {
+                    self.awake[index] = false;
+                    self.alarms.insert((alarm_ns, index));
+                }
+            }
+        }
+    }
+
+    /// Iterates every engine in registration order: the pin's walk, which [`Self::iterate`]
+    /// replaces, kept as the reference it is tested against. Wakes every engine first, so the
+    /// skipping walk re-derives each one's work afterwards.
+    fn iterate_every(&mut self, ts_now: UnixNanos) {
+        for engine in self.values_mut() {
+            engine.iterate(ts_now, AggressorSide::NoAggressor);
+        }
+    }
+
+    /// Returns the instrument IDs of the engines the next iterate will visit before any alarm
+    /// fires, in registration order.
+    #[must_use]
+    pub fn awake_instrument_ids(&self) -> Vec<InstrumentId> {
+        let mut indices = self.awake_slots.clone();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|index| match self.slots.get_index(index) {
+                Some((instrument_id, Some(_))) => Some(*instrument_id),
+                _ => None,
+            })
+            .collect()
     }
 
     fn take(&mut self, instrument_id: &InstrumentId) -> Option<Box<OrderMatchingEngine>> {
@@ -297,6 +379,17 @@ impl MatchingEngines {
             self.live -= 1;
         }
         engine
+    }
+}
+
+/// Marks slot `index` awake (idempotent).
+fn wake(awake: &mut Vec<bool>, awake_slots: &mut Vec<usize>, index: usize) {
+    if awake.len() <= index {
+        awake.resize(index + 1, false);
+    }
+    if !awake[index] {
+        awake[index] = true;
+        awake_slots.push(index);
     }
 }
 
@@ -1035,12 +1128,24 @@ impl SimulatedExchange {
         self.inflight_queue.iter().map(|c| c.timestamp).max()
     }
 
-    /// Iterates all matching engines so newly submitted orders can match
-    /// against the current market state.
+    /// Iterates the matching engines so newly submitted orders can match against the current
+    /// market state.
+    ///
+    /// Visits, in registration order, only the engines whose iterate can do anything: those
+    /// mutated since an iterate last left them with no work, those it left with work, and those
+    /// whose instrument's expiration `ts_now` has reached. Every engine skipped is one the pin's
+    /// walk over all engines would have iterated to no effect, so the order, fill and event
+    /// sequence is the same.
     pub fn iterate_matching_engines(&mut self, ts_now: UnixNanos) {
-        for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.iterate(ts_now, AggressorSide::NoAggressor);
-        }
+        self.matching_engines.iterate(ts_now);
+    }
+
+    /// Iterates every matching engine, as the pin did before [`Self::iterate_matching_engines`]
+    /// learned to skip idle ones. Kept as the reference that method is tested against; the
+    /// backtest engine never calls it.
+    #[doc(hidden)]
+    pub fn iterate_every_matching_engine(&mut self, ts_now: UnixNanos) {
+        self.matching_engines.iterate_every(ts_now);
     }
 
     /// Processes instrument expirations due at the given timestamp.
