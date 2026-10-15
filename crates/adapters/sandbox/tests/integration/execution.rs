@@ -57,10 +57,14 @@ use nautilus_model::{
         AccountAny, MarginAccount,
         margin_model::{MarginModel, MarginModelAny, MarginModelHandle, StandardMarginModel},
     },
-    data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
+    data::{
+        Bar, BarType, BookOrder, Data, InstrumentClose, InstrumentStatus, OrderBookDelta,
+        OrderBookDeltas, QuoteTick, TradeTick,
+    },
     enums::{
-        AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
-        MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, AggressorSide, BookAction, BookType, ContingencyType, InstrumentCloseType,
+        LiquiditySide, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSide, RecordFlag, TimeInForce,
     },
     events::{
         AccountState, OrderDenied, OrderEventAny, OrderFilled, OrderPendingCancel,
@@ -130,6 +134,7 @@ fn create_config(
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model: None,
+        venue_clock_hold: None,
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,
@@ -3602,6 +3607,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
             fill_model: None,
             latency_model: None,
+            venue_clock_hold: None,
             frozen_account: false,
             bar_execution: false,
             trade_execution: false,
@@ -4813,6 +4819,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model,
+        venue_clock_hold: None,
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,
@@ -7504,4 +7511,494 @@ fn test_new_rejects_missing_fee_model(trader_id: TraderId, account_id: AccountId
         err.to_string().contains("explicit fee_model"),
         "unexpected error: {err}"
     );
+}
+
+const HOLD_BASE_NS: u64 = 1_000_000_000;
+const HOLD_LEG_NS: u64 = 10_000_000;
+const HOLD_TIMEOUT_NS: u64 = 45_000_000;
+const MS: u64 = 1_000_000;
+
+/// Builds a started client-only context as [`setup_channel_context`] does, with every latency leg
+/// at `HOLD_LEG_NS`, `venue_clock_hold` at `hold`, and the clock at `HOLD_BASE_NS`.
+fn setup_hold_context(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instruments: &[&InstrumentAny],
+    hold: Option<DurationNanos>,
+    book_type: BookType,
+) -> (
+    TestContext,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let mut context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.latency_model = Some(static_latency_model(HOLD_LEG_NS, HOLD_LEG_NS, HOLD_LEG_NS));
+        config.venue_clock_hold = hold;
+        config.book_type = book_type;
+    });
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    nautilus_common::live::runner::replace_exec_event_sender(tx);
+
+    for instrument in instruments {
+        context
+            .cache
+            .borrow_mut()
+            .add_instrument((*instrument).clone())
+            .unwrap();
+    }
+    context.client.start().unwrap();
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(HOLD_BASE_NS)),
+        0
+    );
+    (context, rx)
+}
+
+/// A quote for the `crypto_perpetual_ethusdt` fixture stamped by the venue at `ts_event`.
+fn stamped_quote(instrument_id: InstrumentId, bid: f64, ask: f64, ts_event: u64) -> QuoteTick {
+    QuoteTick::new(
+        instrument_id,
+        Price::new(bid, 2),
+        Price::new(ask, 2),
+        Quantity::new(100.0, 3),
+        Quantity::new(100.0, 3),
+        UnixNanos::from(ts_event),
+        UnixNanos::from(ts_event),
+    )
+}
+
+/// Delivers `quote` as a live node does: the data engine caches it, then the client receives it.
+fn deliver_quote(context: &TestContext, quote: QuoteTick) {
+    context.cache.borrow_mut().add_quote(quote).unwrap();
+    context.client.process_quote_tick(&quote).unwrap();
+}
+
+/// One `Add` delta for the `crypto_perpetual_ethusdt` fixture, stamped by the venue at `ts_event`,
+/// as its own last-in-batch event.
+fn stamped_add(
+    instrument_id: InstrumentId,
+    side: OrderSide,
+    price: &str,
+    ts_event: u64,
+) -> OrderBookDeltas {
+    let delta = OrderBookDelta::new(
+        instrument_id,
+        BookAction::Add,
+        BookOrder::new(side, Price::from(price), Quantity::from("10.000"), 0),
+        RecordFlag::F_LAST as u8,
+        0,
+        UnixNanos::from(ts_event),
+        UnixNanos::from(ts_event),
+    );
+    OrderBookDeltas::new(instrument_id, vec![delta])
+}
+
+fn event_kinds(events: &[OrderEventAny]) -> Vec<&'static str> {
+    events.iter().map(order_event_kind).collect()
+}
+
+/// The identity check of the fork's venue clock hold: a due command waits through the rows
+/// stamped before its arrival and is applied ahead of the first row stamped at or after it, against
+/// the book the earlier rows built. The ask came down through the limit before the order reached
+/// the venue, so it takes that ask; applied late it would have rested behind the ask's return.
+#[rstest]
+fn test_venue_clock_hold_applies_a_command_before_the_first_row_stamped_after_it(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument],
+        Some(DurationNanos::new(HOLD_TIMEOUT_NS)),
+        BookType::L1_MBP,
+    );
+    let t0 = HOLD_BASE_NS;
+    let due = t0 + HOLD_LEG_NS;
+    deliver_quote(
+        &context,
+        stamped_quote(instrument.id(), 2000.00, 2010.00, t0 - MS),
+    );
+
+    let order = resting_limit(&instrument, "O-HOLD-1", "2005.00", UnixNanos::from(t0));
+    submit_to_client(&context, trader_id, &order);
+    assert_eq!(
+        event_kinds(&apply_order_events_from_channel(&context.cache, &mut rx)),
+        vec!["submitted"],
+    );
+
+    // The leg elapses while the feed lags behind the venue: nothing falls due before the timeout
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(due + 20 * MS)),
+        0
+    );
+
+    deliver_quote(
+        &context,
+        stamped_quote(instrument.id(), 2000.00, 2004.00, due - 5 * MS),
+    );
+    assert!(
+        apply_order_events_from_channel(&context.cache, &mut rx).is_empty(),
+        "a row stamped before the command's arrival must be applied ahead of it, not release it",
+    );
+
+    deliver_quote(
+        &context,
+        stamped_quote(instrument.id(), 2000.00, 2010.00, due + MS),
+    );
+    let events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert_eq!(event_kinds(&events), vec!["accepted", "filled"]);
+    let OrderEventAny::Filled(fill) = &events[1] else {
+        unreachable!()
+    };
+    assert_eq!(
+        (fill.last_px, fill.liquidity_side),
+        (Price::from("2004.00"), LiquiditySide::Taker),
+        "the command must be applied after the row stamped before it and before the one after it",
+    );
+
+    context.client.stop().unwrap();
+}
+
+/// With no row for its instrument, a held command is applied when its timeout passes: the alert is
+/// armed at `due_ns + timeout`, not at `due_ns`.
+#[rstest]
+fn test_venue_clock_hold_applies_a_quiet_instruments_command_at_the_timeout(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument],
+        Some(DurationNanos::new(HOLD_TIMEOUT_NS)),
+        BookType::L1_MBP,
+    );
+    let alert_name = format!("{}-sandbox-inbound-alert", context.client.client_id());
+    let t0 = HOLD_BASE_NS;
+    let due = t0 + HOLD_LEG_NS;
+
+    let order = resting_limit(
+        &instrument,
+        "O-HOLD-QUIET-1",
+        "2005.00",
+        UnixNanos::from(t0),
+    );
+    submit_to_client(&context, trader_id, &order);
+    let _ = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert_eq!(
+        context.test_clock.borrow().next_time_ns(&alert_name),
+        Some(UnixNanos::from(due + HOLD_TIMEOUT_NS)),
+    );
+
+    assert_eq!(
+        advance_and_fire(
+            &context.test_clock,
+            UnixNanos::from(due + HOLD_TIMEOUT_NS - 1)
+        ),
+        0
+    );
+    assert!(apply_order_events_from_channel(&context.cache, &mut rx).is_empty());
+
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(due + HOLD_TIMEOUT_NS)),
+        1
+    );
+    assert_eq!(
+        event_kinds(&apply_order_events_from_channel(&context.cache, &mut rx)),
+        vec!["accepted"],
+    );
+    assert_eq!(context.test_clock.borrow().next_time_ns(&alert_name), None);
+
+    context.client.stop().unwrap();
+}
+
+/// A row of another instrument proves nothing about the held command's book: it releases the
+/// command only once its timeout has passed.
+#[rstest]
+fn test_venue_clock_hold_ignores_rows_of_another_instrument(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let other = make_binary_option_instrument("0xhold", "1", "Yes", 4_000_000_000_000_000_000);
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument, &other],
+        Some(DurationNanos::new(HOLD_TIMEOUT_NS)),
+        BookType::L1_MBP,
+    );
+    let t0 = HOLD_BASE_NS;
+    let due = t0 + HOLD_LEG_NS;
+    let other_quote = |ts_event: u64| {
+        QuoteTick::new(
+            other.id(),
+            Price::new(0.40, 3),
+            Price::new(0.41, 3),
+            Quantity::new(100.0, 2),
+            Quantity::new(100.0, 2),
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_event),
+        )
+    };
+
+    let order = resting_limit(
+        &instrument,
+        "O-HOLD-OTHER-1",
+        "2005.00",
+        UnixNanos::from(t0),
+    );
+    submit_to_client(&context, trader_id, &order);
+    let _ = apply_order_events_from_channel(&context.cache, &mut rx);
+
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(due + 20 * MS)),
+        0
+    );
+    context
+        .client
+        .process_quote_tick(&other_quote(due + 10 * MS))
+        .unwrap();
+    assert!(
+        apply_order_events_from_channel(&context.cache, &mut rx).is_empty(),
+        "a row of another instrument must not release the command",
+    );
+
+    // Past the timeout without the alert having run yet, as jitter can leave it
+    let _ = context
+        .test_clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(due + HOLD_TIMEOUT_NS), true);
+    context
+        .client
+        .process_quote_tick(&other_quote(due + 30 * MS))
+        .unwrap();
+    assert_eq!(
+        event_kinds(&apply_order_events_from_channel(&context.cache, &mut rx)),
+        vec!["accepted"],
+        "any data item must release a command whose timeout has passed",
+    );
+
+    context.client.stop().unwrap();
+}
+
+/// A trade proves nothing about the book: a venue can publish its trades on a channel not ordered
+/// with its book rows, so a trade stamped after a held command's arrival leaves it held, and the
+/// next book row stamped after the arrival releases it.
+#[rstest]
+fn test_venue_clock_hold_is_not_released_by_a_trade(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument],
+        Some(DurationNanos::new(HOLD_TIMEOUT_NS)),
+        BookType::L2_MBP,
+    );
+    let id = instrument.id();
+    let t0 = HOLD_BASE_NS;
+    let due = t0 + HOLD_LEG_NS;
+    for deltas in [
+        stamped_add(id, OrderSide::Buy, "2000.00", t0 - MS),
+        stamped_add(id, OrderSide::Sell, "2010.00", t0 - MS),
+    ] {
+        context.client.process_order_book_deltas(&deltas).unwrap();
+    }
+
+    let order = resting_limit(
+        &instrument,
+        "O-HOLD-TRADE-1",
+        "2005.00",
+        UnixNanos::from(t0),
+    );
+    submit_to_client(&context, trader_id, &order);
+    let _ = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(due + 20 * MS)),
+        0
+    );
+
+    let trade = TradeTick::new(
+        id,
+        Price::from("2010.00"),
+        Quantity::from("1.000"),
+        AggressorSide::Buy,
+        TradeId::new("HOLD-TRADE-1"),
+        UnixNanos::from(due + 5 * MS),
+        UnixNanos::from(due + 5 * MS),
+    );
+    context.client.process_trade_tick(&trade).unwrap();
+    assert!(
+        apply_order_events_from_channel(&context.cache, &mut rx).is_empty(),
+        "a trade stamped after the command's arrival must not release it",
+    );
+
+    context
+        .client
+        .process_order_book_deltas(&stamped_add(id, OrderSide::Buy, "1999.00", due + 10 * MS))
+        .unwrap();
+    assert_eq!(
+        event_kinds(&apply_order_events_from_channel(&context.cache, &mut rx)),
+        vec!["accepted"],
+        "the next book row stamped after the arrival must release the command",
+    );
+
+    context.client.stop().unwrap();
+}
+
+/// Two commands for one instrument keep their `(due_ns, seq)` order: a row stamped between their
+/// arrivals releases only the first, and a cancel behind a held submit waits for it.
+#[rstest]
+fn test_venue_clock_hold_keeps_two_commands_in_order(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+    #[values(false, true)] one_row_releases_both: bool,
+) {
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument],
+        Some(DurationNanos::new(HOLD_TIMEOUT_NS)),
+        BookType::L1_MBP,
+    );
+    let t0 = HOLD_BASE_NS;
+
+    let order = resting_limit(
+        &instrument,
+        "O-HOLD-ORDER-1",
+        "2005.00",
+        UnixNanos::from(t0),
+    );
+    submit_to_client(&context, trader_id, &order);
+    let _ = apply_order_events_from_channel(&context.cache, &mut rx);
+
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(t0 + 5 * MS)),
+        0
+    );
+    let cancel_ts = context.test_clock.borrow().timestamp_ns();
+    context
+        .client
+        .cancel_order(cancel_command(
+            context.client.client_id(),
+            trader_id,
+            &order,
+            cancel_ts,
+        ))
+        .unwrap();
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(t0 + 30 * MS)),
+        0
+    );
+
+    let mut kinds = Vec::new();
+    if !one_row_releases_both {
+        // Stamped after the submit's arrival (t0 + 10ms) and before the cancel's (t0 + 15ms)
+        deliver_quote(
+            &context,
+            stamped_quote(instrument.id(), 2000.00, 2010.00, t0 + 12 * MS),
+        );
+        kinds = event_kinds(&apply_order_events_from_channel(&context.cache, &mut rx));
+        assert_eq!(kinds, vec!["accepted"]);
+    }
+    deliver_quote(
+        &context,
+        stamped_quote(instrument.id(), 2000.00, 2010.00, t0 + 20 * MS),
+    );
+    kinds.extend(event_kinds(&apply_order_events_from_channel(
+        &context.cache,
+        &mut rx,
+    )));
+
+    assert_eq!(kinds, vec!["accepted", "canceled"]);
+    assert_eq!(cached_status(&context.cache, &order), OrderStatus::Canceled);
+
+    context.client.stop().unwrap();
+}
+
+/// A post-only bid reaching the venue after a delta that crossed it is rejected post-only, as the
+/// venue rejects it, when the delta reaches the client late. Without the hold the bid is accepted
+/// against the stale book and then filled by the late delta.
+#[rstest]
+#[case::hold_rejects(Some(DurationNanos::new(HOLD_TIMEOUT_NS)), vec!["rejected"])]
+#[case::no_hold_accepts_then_fills(None, vec!["accepted", "filled"])]
+fn test_venue_clock_hold_rejects_a_post_only_bid_a_late_delta_crosses(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+    #[case] hold: Option<DurationNanos>,
+    #[case] expected: Vec<&str>,
+) {
+    let (mut context, mut rx) = setup_hold_context(
+        trader_id,
+        account_id,
+        venue,
+        &[&instrument],
+        hold,
+        BookType::L2_MBP,
+    );
+    let id = instrument.id();
+    let t0 = HOLD_BASE_NS;
+    let due = t0 + HOLD_LEG_NS;
+    for deltas in [
+        stamped_add(id, OrderSide::Buy, "2000.00", t0 - MS),
+        stamped_add(id, OrderSide::Sell, "2010.00", t0 - MS),
+    ] {
+        context.client.process_order_book_deltas(&deltas).unwrap();
+    }
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(id)
+        .side(OrderSide::Buy)
+        .price(Price::from("2005.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-HOLD-POST-ONLY-1".into())
+        .post_only(true)
+        .ts_init(UnixNanos::from(t0))
+        .build();
+    submit_to_client(&context, trader_id, &order);
+    let mut events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert_eq!(event_kinds(&events), vec!["submitted"]);
+    events.clear();
+
+    // The order reaches the venue at `due`, just after an ask at 2004 the client receives late
+    let _ = advance_and_fire(&context.test_clock, UnixNanos::from(due + 20 * MS));
+    events.extend(apply_order_events_from_channel(&context.cache, &mut rx));
+    context
+        .client
+        .process_order_book_deltas(&stamped_add(id, OrderSide::Sell, "2004.00", due - 5 * MS))
+        .unwrap();
+    events.extend(apply_order_events_from_channel(&context.cache, &mut rx));
+    let _ = advance_and_fire(&context.test_clock, UnixNanos::from(due + HOLD_TIMEOUT_NS));
+    events.extend(apply_order_events_from_channel(&context.cache, &mut rx));
+
+    assert_eq!(event_kinds(&events), expected);
+    if let OrderEventAny::Rejected(rejected) = &events[0] {
+        assert!(
+            rejected.due_post_only,
+            "rejected for a reason other than post-only"
+        );
+    }
+
+    context.client.stop().unwrap();
 }

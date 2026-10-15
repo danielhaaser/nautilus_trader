@@ -16,6 +16,7 @@
 //! Configuration for sandbox execution client.
 
 use ahash::AHashMap;
+use nautilus_core::DurationNanos;
 use nautilus_execution::{
     matching_engine::config::OrderMatchingEngineConfig,
     models::{fee::FeeModelAny, fill::FillModelAny, latency::LatencyModelAny},
@@ -102,6 +103,19 @@ pub struct SandboxExecutionClientConfig {
         deserialize_with = "deserialize_latency_model"
     )]
     pub latency_model: Option<LatencyModelAny>,
+    /// The longest a latency-deferred command waits for the venue's book to catch up with it.
+    ///
+    /// The `latency_model` sets when a command reaches the venue (`due_ns`), but the market data
+    /// the venue had applied by then can still be on its way to this client. With a timeout set, a
+    /// command for an instrument is applied once a book row for that instrument (order book
+    /// deltas or a quote) stamped (`ts_event`) at or after `due_ns` has been received, ahead of
+    /// that row, or once `due_ns` plus the timeout has passed, whichever comes first. Rows stamped
+    /// before `due_ns` are applied ahead of it, as the venue applied them. Trades and bars prove
+    /// nothing about the book, since a venue can publish them on a channel not ordered with its
+    /// book rows: they release only commands whose timeout has passed. A command without an
+    /// instrument is applied at `due_ns`. Has no effect without a `latency_model`; `None` (the
+    /// default) applies each command as soon as its latency has elapsed.
+    pub venue_clock_hold: Option<DurationNanos>,
     /// If True, account balances won't change (frozen).
     #[builder(default)]
     pub frozen_account: bool,
@@ -332,6 +346,7 @@ mod tests {
         assert!(config.fee_model.is_none());
         assert!(config.fill_model.is_none());
         assert!(config.latency_model.is_none());
+        assert!(config.venue_clock_hold.is_none());
         assert!(config.margin_model.is_none());
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
@@ -342,6 +357,17 @@ mod tests {
         assert!(!config.use_market_order_acks);
         assert!(!config.oto_full_trigger);
         assert_eq!(config.price_protection_points, 0);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_reads_venue_clock_hold() {
+        let config: SandboxExecutionClientConfig =
+            toml::from_str("venue_clock_hold = 45000000").unwrap();
+
+        assert_eq!(
+            config.venue_clock_hold,
+            Some(DurationNanos::from_millis(45))
+        );
     }
 
     #[rstest]
