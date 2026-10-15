@@ -162,6 +162,7 @@ impl SandboxExecutionClient {
                 inbound_queue: BinaryHeap::new(),
                 inflight_orders: InflightOrders::default(),
                 inbound_seq: 0,
+                latest_ts_event: AHashMap::new(),
                 client_id: core.client_id,
                 account_id: core.account_id,
                 self_weak: WeakCell::from(weak.clone()),
@@ -448,7 +449,7 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
-        SandboxInner::drain_inbound(&self.inner);
+        SandboxInner::drain_inbound(&self.inner, Some((quote.instrument_id, quote.ts_event)));
 
         let instrument_id = quote.instrument_id;
         let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
@@ -471,7 +472,7 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_trade_tick(&self, trade: &TradeTick) -> anyhow::Result<()> {
-        SandboxInner::drain_inbound(&self.inner);
+        SandboxInner::drain_inbound(&self.inner, None);
 
         if !self.config.trade_execution {
             return Ok(());
@@ -498,7 +499,7 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_bar(&self, bar: &Bar) -> anyhow::Result<()> {
-        SandboxInner::drain_inbound(&self.inner);
+        SandboxInner::drain_inbound(&self.inner, None);
 
         if !self.config.bar_execution {
             return Ok(());
@@ -525,7 +526,7 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
-        SandboxInner::drain_inbound(&self.inner);
+        SandboxInner::drain_inbound(&self.inner, Some((deltas.instrument_id, deltas.ts_event)));
 
         let instrument_id = deltas.instrument_id;
         let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
@@ -553,6 +554,7 @@ impl SandboxExecutionClient {
         }
 
         inner.clear_inbound_queue();
+        inner.latest_ts_event.clear();
         self.cancel_inbound_alert();
 
         log::info!(
@@ -746,7 +748,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
-            inner.apply_submit_order(&cmd)?;
+            inner.apply_submit_order(&cmd, None)?;
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrder(cmd));
         }
@@ -773,7 +775,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
-            let _ = inner.apply_submit_order_list(&cmd);
+            let _ = inner.apply_submit_order_list(&cmd, None);
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrderList(cmd));
         }
@@ -909,6 +911,11 @@ struct SandboxInner {
     /// Monotonic sequence providing FIFO tie-breaking for deferred commands sharing a due time, so
     /// no queued command can be overtaken by one enqueued after it.
     inbound_seq: u64,
+    /// The latest `ts_event` of the book data (order book deltas and quotes) received per
+    /// instrument, kept only under `venue_clock_hold`: a stamp at or after a held command's
+    /// `due_ns` proves the venue's book for that instrument has caught up with the command. Trades
+    /// and bars do not advance it, since they need not arrive in order with the book rows.
+    latest_ts_event: AHashMap<InstrumentId, UnixNanos>,
     client_id: ClientId,
     account_id: AccountId,
     self_weak: WeakCell<Self>,
@@ -1176,6 +1183,7 @@ impl SandboxInner {
         }
 
         self.matching_engines.remove(&instrument_id);
+        self.latest_ts_event.remove(&instrument_id);
         self.cache
             .borrow_mut()
             .purge_instrument_skip_order_guard(instrument_id);
@@ -1204,7 +1212,14 @@ impl SandboxInner {
     }
 
     /// Routes a deferred [`TradingCommand`] to its venue-side apply helper.
-    fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
+    ///
+    /// `cached_data_cap` bounds the cached quote and trade a submit primes its engine with (see
+    /// [`Self::apply_submit_order`]).
+    fn apply_trading_command(
+        &mut self,
+        cmd: &TradingCommand,
+        cached_data_cap: Option<UnixNanos>,
+    ) -> anyhow::Result<()> {
         self.inflight_orders.remove(cmd);
 
         // Only a deferred command can overtake the submit that would have created the engine, so
@@ -1222,10 +1237,10 @@ impl SandboxInner {
         }
 
         match cmd {
-            TradingCommand::SubmitOrder(cmd) => self.apply_submit_order(cmd)?,
+            TradingCommand::SubmitOrder(cmd) => self.apply_submit_order(cmd, cached_data_cap)?,
             TradingCommand::SubmitOrderList(cmd) => {
                 // Only a deferred leg has an `OrderSubmitted` out that nothing else would resolve
-                for order in self.apply_submit_order_list(cmd) {
+                for order in self.apply_submit_order_list(cmd, cached_data_cap) {
                     self.reject_submit_leg(cmd, &order, "No instrument for order");
                 }
             }
@@ -1432,7 +1447,17 @@ impl SandboxInner {
         self.matching_engines.contains_key(&instrument_id)
     }
 
-    fn apply_submit_order(&mut self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    /// Applies a submit-order command to its matching engine (venue-side), first priming the
+    /// engine with the cached quote and trade.
+    ///
+    /// With `cached_data_cap` set, a cached quote or trade stamped after it is not primed: the
+    /// data engine caches an item before this client receives it, so under `venue_clock_hold` the
+    /// cache can already hold the item a held command must be applied ahead of.
+    fn apply_submit_order(
+        &mut self,
+        cmd: &SubmitOrder,
+        cached_data_cap: Option<UnixNanos>,
+    ) -> anyhow::Result<()> {
         let mut order = self.cache.borrow().try_order_owned(&cmd.client_order_id)?;
 
         let instrument_id = order.instrument_id();
@@ -1440,7 +1465,7 @@ impl SandboxInner {
 
         self.ensure_matching_engine(&instrument);
 
-        self.seed_cached_market_data(instrument_id);
+        self.seed_cached_market_data(instrument_id, cached_data_cap);
 
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             engine.process_order(&mut order, self.account_id);
@@ -1452,8 +1477,12 @@ impl SandboxInner {
 
     /// Applies a submit-order-list command to the matching engines (venue-side), less the per-order
     /// `OrderSubmitted` dispatch kept by the client handler, returning the legs that could not
-    /// reach a matching engine.
-    fn apply_submit_order_list(&mut self, cmd: &SubmitOrderList) -> Vec<OrderAny> {
+    /// reach a matching engine. Primes each engine as [`Self::apply_submit_order`] does.
+    fn apply_submit_order_list(
+        &mut self,
+        cmd: &SubmitOrderList,
+        cached_data_cap: Option<UnixNanos>,
+    ) -> Vec<OrderAny> {
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
@@ -1482,7 +1511,7 @@ impl SandboxInner {
 
             self.ensure_matching_engine(&instrument);
 
-            self.seed_cached_market_data(instrument_id);
+            self.seed_cached_market_data(instrument_id, cached_data_cap);
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
                 let mut order_clone = order.clone();
@@ -1515,7 +1544,15 @@ impl SandboxInner {
         )));
     }
 
-    fn seed_cached_market_data(&mut self, instrument_id: InstrumentId) {
+    /// Primes an engine with the cached quote and trade. With `cached_data_cap` set, a cached quote
+    /// or trade stamped after it is not primed: the data engine caches an item before this client
+    /// receives it, so under `venue_clock_hold` the cache can already hold the item a held command
+    /// must be applied ahead of.
+    fn seed_cached_market_data(
+        &mut self,
+        instrument_id: InstrumentId,
+        cached_data_cap: Option<UnixNanos>,
+    ) {
         let Some(engine) = self.matching_engines.get_mut(&instrument_id) else {
             return;
         };
@@ -1536,6 +1573,7 @@ impl SandboxInner {
         };
 
         if let Some(quote) = quote
+            && is_within_cap(quote.ts_event, cached_data_cap)
             && check_quote_or_drop("cached quote tick", &quote, &engine.instrument)
         {
             engine.process_quote_tick(&quote);
@@ -1543,6 +1581,7 @@ impl SandboxInner {
 
         if self.config.trade_execution
             && let Some(trade) = trade
+            && is_within_cap(trade.ts_event, cached_data_cap)
             && check_trade_or_drop("cached trade tick", &trade, &engine.instrument)
         {
             engine.process_trade_tick(&trade);
@@ -1609,8 +1648,19 @@ impl SandboxInner {
     ///
     /// A zero-leg command is still queued behind a head already due, so the two apply in
     /// `(due_ns, seq)` order.
+    ///
+    /// Under `venue_clock_hold` every command is queued, a zero-leg one included, and applied at
+    /// once only if [`Self::release_held`] finds it releasable already.
     fn defer_or_apply(&mut self, command: TradingCommand) {
         let now_ns = self.clock.borrow().timestamp_ns();
+
+        if let Some(hold) = self.config.venue_clock_hold {
+            self.enqueue(command, now_ns);
+            self.release_held(hold, now_ns);
+            self.arm_inbound_alert(now_ns);
+            return;
+        }
+
         let head_is_due = self
             .inbound_queue
             .peek()
@@ -1621,7 +1671,7 @@ impl SandboxInner {
             return;
         }
 
-        if let Err(e) = self.apply_trading_command(&command) {
+        if let Err(e) = self.apply_trading_command(&command, None) {
             log::error!("Error applying command: {e}");
             self.reject_command(&command, "Command could not be applied at the venue");
         }
@@ -1655,32 +1705,34 @@ impl SandboxInner {
     }
 
     fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, Some((quote.instrument_id, quote.ts_event)));
         inner.borrow_mut().process_quote_tick(quote);
     }
 
+    // Trades, bars, status and close events are not book rows and need not reach the client in
+    // order with them, so they prove nothing about the book: they release only timed-out commands
     fn on_trade_tick(inner: &Rc<RefCell<Self>>, trade: &TradeTick) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, None);
         inner.borrow_mut().process_trade_tick(trade);
     }
 
     fn on_bar(inner: &Rc<RefCell<Self>>, bar: &Bar) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, None);
         inner.borrow_mut().process_bar(bar);
     }
 
     fn on_order_book_deltas(inner: &Rc<RefCell<Self>>, deltas: &OrderBookDeltas) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, Some((deltas.instrument_id, deltas.ts_event)));
         inner.borrow_mut().process_order_book_deltas(deltas);
     }
 
     fn on_instrument_status(inner: &Rc<RefCell<Self>>, status: &InstrumentStatus) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, None);
         inner.borrow_mut().process_instrument_status(status);
     }
 
     fn on_instrument_close(inner: &Rc<RefCell<Self>>, close: &InstrumentClose) {
-        Self::drain_inbound(inner);
+        Self::drain_inbound(inner, None);
         inner.borrow_mut().process_instrument_close(close);
     }
 
@@ -1690,7 +1742,12 @@ impl SandboxInner {
     /// Called at the top of each data handler and public `process_*` method, so a command due
     /// before a tick is processed is applied before that tick, and by the alert when no data is
     /// flowing.
-    fn drain_inbound(inner: &Rc<RefCell<Self>>) {
+    ///
+    /// `received` is the instrument and `ts_event` of the book row (order book deltas or a quote)
+    /// about to be processed, and `None` for every other item (trades, bars, status, close, the
+    /// alert). Under `venue_clock_hold` it advances that instrument's latest stamp first, then
+    /// [`Self::release_held`] decides what is applied; without the hold it is unused.
+    fn drain_inbound(inner: &Rc<RefCell<Self>>, received: Option<(InstrumentId, UnixNanos)>) {
         // The alert fires on the runner task, where a nested msgbus dispatch may already hold the
         // borrow; the next data tick or public `process_*` call releases the queue instead.
         let Ok(mut this) = inner.try_borrow_mut() else {
@@ -1704,17 +1761,95 @@ impl SandboxInner {
 
         let now_ns = this.clock.borrow().timestamp_ns();
 
-        while let Some(delayed) = this.pop_due(now_ns) {
-            if let Err(e) = this.apply_trading_command(&delayed.command) {
+        if let Some(hold) = this.config.venue_clock_hold {
+            if let Some((instrument_id, ts_event)) = received {
+                let latest = this.latest_ts_event.entry(instrument_id).or_default();
+                *latest = (*latest).max(ts_event);
+            }
+            this.release_held(hold, now_ns);
+        } else {
+            while let Some(delayed) = this.pop_due(now_ns) {
+                if let Err(e) = this.apply_trading_command(&delayed.command, None) {
+                    log::error!("Error applying deferred command: {e}");
+                    this.reject_command(
+                        &delayed.command,
+                        "Command could not be applied at the venue",
+                    );
+                }
+            }
+        }
+
+        this.arm_inbound_alert(now_ns);
+    }
+
+    /// Applies every queued command `venue_clock_hold` releases at `now_ns`, in `(due_ns, seq)`
+    /// order, leaving the rest queued.
+    ///
+    /// A command for an instrument is released once the latest stamp received for it reaches the
+    /// command's `due_ns` (the venue's book has caught up with its arrival) or once `due_ns + hold`
+    /// has passed; one without an instrument once `due_ns` has passed. A later `due_ns` never
+    /// makes a command for the same instrument easier to release, so none is released ahead of an
+    /// earlier one for its instrument: a cancel queued behind a held submit waits for it.
+    fn release_held(&mut self, hold: DurationNanos, now_ns: UnixNanos) {
+        if self.inbound_queue.is_empty() {
+            return;
+        }
+
+        // `DelayedCommand` orders in reverse, so the ascending sort runs latest-due first
+        let mut queued = std::mem::take(&mut self.inbound_queue).into_sorted_vec();
+        queued.reverse();
+
+        let (released, held): (Vec<DelayedCommand>, Vec<DelayedCommand>) = queued
+            .into_iter()
+            .partition(|delayed| self.is_released(delayed, hold, now_ns));
+        self.inbound_queue = BinaryHeap::from(held);
+
+        for delayed in released {
+            // The cache can already hold the item that released the command, which the venue
+            // applied after it
+            if let Err(e) = self.apply_trading_command(&delayed.command, Some(delayed.due_ns)) {
                 log::error!("Error applying deferred command: {e}");
-                this.reject_command(
+                self.reject_command(
                     &delayed.command,
                     "Command could not be applied at the venue",
                 );
             }
         }
+    }
 
-        this.arm_inbound_alert(now_ns);
+    /// Returns whether `venue_clock_hold` releases `delayed` at `now_ns` (see
+    /// [`Self::release_held`]).
+    fn is_released(
+        &self,
+        delayed: &DelayedCommand,
+        hold: DurationNanos,
+        now_ns: UnixNanos,
+    ) -> bool {
+        let Some(instrument_id) = held_instrument_id(&delayed.command) else {
+            return delayed.due_ns <= now_ns;
+        };
+
+        now_ns >= delayed.due_ns + hold
+            || self
+                .latest_ts_event
+                .get(&instrument_id)
+                .is_some_and(|latest| *latest >= delayed.due_ns)
+    }
+
+    /// Returns the earliest instant a queued command can be released without further market data:
+    /// its `due_ns`, or under `venue_clock_hold` its `due_ns + hold` when it names an instrument.
+    fn next_release_ns(&self) -> Option<UnixNanos> {
+        let Some(hold) = self.config.venue_clock_hold else {
+            return self.inbound_queue.peek().map(|delayed| delayed.due_ns);
+        };
+
+        self.inbound_queue
+            .iter()
+            .map(|delayed| match held_instrument_id(&delayed.command) {
+                Some(_) => delayed.due_ns + hold,
+                None => delayed.due_ns,
+            })
+            .min()
     }
 
     /// Takes every command still deferred by inbound latency, ordered for [`Self::reject_discarded`]
@@ -1761,13 +1896,14 @@ impl SandboxInner {
     }
 
     /// (Re)arms the `LiveClock` alert for the earliest queued `due_ns` while that is still ahead
-    /// of `now_ns`.
+    /// of `now_ns` (under `venue_clock_hold`, the earliest instant [`Self::next_release_ns`]
+    /// names).
     ///
     /// A due time already reached is not armed for: the drain releasing it is already pending on
     /// the runner, and an alert at a time the clock has passed only asks the clock to warn. The
     /// clock reads its own time again when arming, so a leg shorter than that gap can still warn.
     fn arm_inbound_alert(&self, now_ns: UnixNanos) {
-        let Some(earliest_due) = self.inbound_queue.peek().map(|delayed| delayed.due_ns) else {
+        let Some(earliest_due) = self.next_release_ns() else {
             return;
         };
 
@@ -1800,7 +1936,7 @@ impl SandboxInner {
             }
 
             // The pass arms for whatever it leaves queued
-            Self::drain_inbound(&inner_rc);
+            Self::drain_inbound(&inner_rc, None);
         });
 
         if let Err(e) = self.clock.borrow_mut().set_time_alert_ns(
@@ -1816,6 +1952,21 @@ impl SandboxInner {
 
 fn inbound_alert_name(client_id: ClientId) -> String {
     format!("{client_id}-sandbox-inbound-alert")
+}
+
+/// Returns the instrument whose market data `venue_clock_hold` waits on for `command`, or `None`
+/// for a command that names none. A `SubmitOrderList` waits on the list's own `instrument_id`.
+fn held_instrument_id(command: &TradingCommand) -> Option<InstrumentId> {
+    match command {
+        TradingCommand::QueryAccount(_) => None,
+        command => Some(command.instrument_id()),
+    }
+}
+
+/// Returns whether a cached item stamped `ts_event` may prime a matching engine for a command
+/// applied with `cap` (always, without one).
+fn is_within_cap(ts_event: UnixNanos, cap: Option<UnixNanos>) -> bool {
+    cap.is_none_or(|cap| ts_event <= cap)
 }
 
 fn check_quote_or_drop(context: &str, quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
