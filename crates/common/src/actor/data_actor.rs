@@ -874,7 +874,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = DataActor::on_time_event(self, event) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_time_event", &e);
         }
     }
 
@@ -891,7 +891,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_data(data) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_data", &e);
         }
     }
 
@@ -908,7 +908,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_signal(signal) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_signal", &e);
         }
     }
 
@@ -925,7 +925,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_queue_state(event) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_queue_state", &e);
         }
     }
 
@@ -942,7 +942,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_socket_state(event) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_socket_state", &e);
         }
     }
 
@@ -959,7 +959,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_instrument(instrument) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_instrument", &e);
         }
     }
 
@@ -976,7 +976,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_book_deltas(deltas) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_book_deltas", &e);
         }
     }
 
@@ -993,7 +993,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_book_depth(depth) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_book_depth", &e);
         }
     }
 
@@ -1010,7 +1010,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_book(book) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_book", &e);
         }
     }
 
@@ -1022,7 +1022,7 @@ pub trait DataActor {
         log_received(&quote);
 
         if let Err(e) = self.core().handle_indicators_for_quote(quote) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "indicators", &e);
             return;
         }
 
@@ -1032,7 +1032,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_quote(quote) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_quote", &e);
         }
     }
 
@@ -1044,7 +1044,7 @@ pub trait DataActor {
         log_received(&trade);
 
         if let Err(e) = self.core().handle_indicators_for_trade(trade) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "indicators", &e);
             return;
         }
 
@@ -1054,7 +1054,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_trade(trade) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_trade", &e);
         }
     }
 
@@ -1066,7 +1066,7 @@ pub trait DataActor {
         log_received(&bar);
 
         if let Err(e) = self.core().handle_indicators_for_bar(bar) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "indicators", &e);
             return;
         }
 
@@ -1076,7 +1076,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_bar(bar) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_bar", &e);
         }
     }
 
@@ -1093,7 +1093,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_mark_price(mark_price) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_mark_price", &e);
         }
     }
 
@@ -1110,7 +1110,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_index_price(index_price) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_index_price", &e);
         }
     }
 
@@ -1127,7 +1127,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_funding_rate(funding_rate) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_funding_rate", &e);
         }
     }
 
@@ -1144,7 +1144,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_option_greeks(greeks) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_option_greeks", &e);
         }
     }
 
@@ -1161,7 +1161,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_option_chain(slice) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_option_chain", &e);
         }
     }
 
@@ -1178,7 +1178,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_instrument_status(status) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_instrument_status", &e);
         }
     }
 
@@ -1195,7 +1195,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_instrument_close(close) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_instrument_close", &e);
         }
     }
 
@@ -1213,7 +1213,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_block(block) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_block", &e);
         }
     }
 
@@ -1231,7 +1231,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_pool(pool) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_pool", &e);
         }
     }
 
@@ -1249,7 +1249,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_pool_swap(swap) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_pool_swap", &e);
         }
     }
 
@@ -1267,7 +1267,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_pool_liquidity_update(update) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_pool_liquidity_update", &e);
         }
     }
 
@@ -1285,7 +1285,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_pool_fee_collect(collect) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_pool_fee_collect", &e);
         }
     }
 
@@ -1303,7 +1303,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_pool_flash(flash) {
-            log_error(&e);
+            handler_error(Some(self.component_id()), "on_pool_flash", &e);
         }
     }
 
@@ -1312,7 +1312,7 @@ pub trait DataActor {
         log_received(&data);
 
         if let Err(e) = self.on_historical_data(data) {
-            log_error(&e);
+            handler_error(None, "on_historical_data", &e);
         }
     }
 
@@ -1326,7 +1326,7 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_historical_data(resp.data.as_ref()) {
-            log_error(&e);
+            handler_error(None, "on_historical_data", &e);
         }
     }
 
@@ -1335,7 +1335,7 @@ pub trait DataActor {
         log_received(&resp);
 
         if let Err(e) = self.on_instrument(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_instrument", &e);
         }
     }
 
@@ -1346,7 +1346,7 @@ pub trait DataActor {
 
         for inst in &resp.data {
             if let Err(e) = self.on_instrument(inst) {
-                log_error(&e);
+                handler_error(None, "on_instrument", &e);
             }
         }
     }
@@ -1356,7 +1356,7 @@ pub trait DataActor {
         log_received(&resp);
 
         if let Err(e) = self.on_book(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_book", &e);
         }
     }
 
@@ -1366,7 +1366,7 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.on_historical_book_deltas(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_book_deltas", &e);
         }
     }
 
@@ -1376,7 +1376,7 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.on_historical_book_depth(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_book_depth", &e);
         }
     }
 
@@ -1389,12 +1389,12 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.core().handle_indicators_for_quotes(&resp.data) {
-            log_error(&e);
+            handler_error(None, "indicators", &e);
             return;
         }
 
         if let Err(e) = self.on_historical_quotes(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_quotes", &e);
         }
     }
 
@@ -1407,12 +1407,12 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.core().handle_indicators_for_trades(&resp.data) {
-            log_error(&e);
+            handler_error(None, "indicators", &e);
             return;
         }
 
         if let Err(e) = self.on_historical_trades(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_trades", &e);
         }
     }
 
@@ -1425,12 +1425,12 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.core().handle_indicators_for_bars(&resp.data) {
-            log_error(&e);
+            handler_error(None, "indicators", &e);
             return;
         }
 
         if let Err(e) = self.on_historical_bars(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_bars", &e);
         }
     }
 
@@ -1444,7 +1444,7 @@ pub trait DataActor {
         log::trace!("{RECV} {resp:?}");
 
         if let Err(e) = self.on_historical_funding_rates(&resp.data) {
-            log_error(&e);
+            handler_error(None, "on_historical_funding_rates", &e);
         }
     }
 
@@ -5954,6 +5954,13 @@ fn check_timestamps(
 
 fn log_error(e: &anyhow::Error) {
     log::error!("{e}");
+}
+
+/// A data handler returned `e`: logged as before, then handed to the process's handler-error
+/// hook, if one is set ([`super::handler_error`]).
+fn handler_error(component: Option<ComponentId>, handler: &'static str, e: &anyhow::Error) {
+    log_error(e);
+    super::handler_error::report(component, handler, e);
 }
 
 fn log_not_running<T>(msg: &T)
