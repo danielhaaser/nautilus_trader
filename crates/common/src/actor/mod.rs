@@ -28,6 +28,7 @@ use ustr::Ustr;
 #[doc(hidden)]
 pub mod binding;
 pub mod data_actor;
+pub mod handler_error;
 pub mod indicators;
 pub mod registry;
 
