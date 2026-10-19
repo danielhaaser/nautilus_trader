@@ -757,6 +757,10 @@ impl SimulatedExchange {
     /// rebuilt with its raw ID in that settled state (`OrderMatchingEngine::restore_settled`) and
     /// behaves as the removed one would have. Its slot keeps the instrument's position in the
     /// engine order, and the instrument itself stays registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an engine found removable is gone from the engine map before it is taken.
     pub fn remove_settled_instruments(&mut self) -> usize {
         if self.has_modules() || self.settled_engines.is_empty() {
             return 0;
@@ -793,10 +797,10 @@ impl SimulatedExchange {
                 matching_engine.instrument,
                 InstrumentAny::OptionContract(_) | InstrumentAny::CryptoOption(_)
             )
-            || !matching_engine
+            || matching_engine
                 .instrument
                 .expiration_ns()
-                .is_some_and(|expiration_ns| ts_now >= expiration_ns)
+                .is_none_or(|expiration_ns| ts_now < expiration_ns)
         {
             return None;
         }
@@ -1154,6 +1158,10 @@ impl SimulatedExchange {
     /// before `ts_now` and is not yet settled. A settled engine (expiration processed, or option
     /// settlement failed) returns from `process_instrument_expiration` without effect, so skipping
     /// it is exact; the index replaces a walk over every registered engine per instant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a due engine is missing from the engine map.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
         let reached = match ts_now.as_u64().checked_add(1) {
             Some(next) => {

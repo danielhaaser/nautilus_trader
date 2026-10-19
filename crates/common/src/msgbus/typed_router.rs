@@ -332,7 +332,7 @@ impl<T: 'static> TopicRouter<T> {
     /// excluding wildcard pattern subscriptions.
     #[must_use]
     pub fn exact_subscriber_count(&self, topic: MStr<Topic>) -> usize {
-        self.exact.get(&*topic).map_or(0, |subs| subs.len())
+        self.exact.get(&*topic).map_or(0, SmallVec::len)
     }
 
     /// Handlers matching a topic, in delivery order: the topic's exact subscriptions merged

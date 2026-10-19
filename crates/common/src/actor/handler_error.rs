@@ -70,9 +70,12 @@ mod tests {
 
     use super::*;
 
+    /// Each error the hook saw: component, handler and error text.
+    type Seen = Arc<Mutex<Vec<(Option<String>, &'static str, String)>>>;
+
     #[rstest]
     fn test_hook_sees_each_error_and_clears() {
-        let seen: Arc<Mutex<Vec<(Option<String>, &'static str, String)>>> = Arc::default();
+        let seen: Seen = Arc::default();
         let keep = Arc::clone(&seen);
         set_handler_error_hook(move |e| {
             keep.lock().unwrap().push((

@@ -5368,7 +5368,7 @@ fn settle_then_submit(release: bool) -> (usize, bool, Vec<String>) {
     );
     exchange
         .borrow_mut()
-        .add_instrument(instrument.clone())
+        .add_instrument(instrument)
         .unwrap();
     let (handler, saving_handler) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
     msgbus::register_order_event_endpoint(MessagingSwitchboard::exec_engine_process(), handler);
