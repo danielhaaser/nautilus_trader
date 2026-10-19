@@ -1142,17 +1142,29 @@ impl BacktestEngine {
         // Drain first so latency-deferred commands reach venue inflight queues
         self.drain_command_queues()?;
 
-        // Advance the clock to the latest inflight arrival; otherwise commands deferred
-        // by a LatencyModel sit past ts_now and never settle.
-        if let Some(max_inflight_ts) = self.max_inflight_command_ts()
-            && max_inflight_ts > ts_now
-        {
-            ts_now = max_inflight_ts;
-            let clocks = self.collect_all_clocks();
-            Self::set_all_clocks_time(&clocks, ts_now);
-        }
+        // Advance the clock to the latest inflight arrival, or the latest release of an order
+        // event the venue holds; otherwise commands and events deferred by a LatencyModel sit
+        // past ts_now and never settle.
+        // A command applied there can leave its order events held later still, so repeat until
+        // nothing is held past the clock.
+        loop {
+            if let Some(max_inflight_ts) = self.max_inflight_command_ts()
+                && max_inflight_ts > ts_now
+            {
+                ts_now = max_inflight_ts;
+                let clocks = self.collect_all_clocks();
+                Self::set_all_clocks_time(&clocks, ts_now);
+            }
 
-        self.settle_venues(ts_now, SettlementScope::All)?;
+            self.settle_venues(ts_now, SettlementScope::All)?;
+
+            if self
+                .max_inflight_command_ts()
+                .is_none_or(|max_inflight_ts| max_inflight_ts <= ts_now)
+            {
+                break;
+            }
+        }
 
         for strategy_id in self.running_strategy_ids() {
             log::error!(
@@ -2109,7 +2121,14 @@ impl BacktestEngine {
     fn max_inflight_command_ts(&self) -> Option<UnixNanos> {
         self.venues
             .values()
-            .filter_map(|v| v.borrow().max_inflight_command_ts())
+            .flat_map(|v| {
+                let exchange = v.borrow();
+                [
+                    exchange.max_inflight_command_ts(),
+                    exchange.max_outbound_event_ts(),
+                ]
+            })
+            .flatten()
             .max()
     }
 

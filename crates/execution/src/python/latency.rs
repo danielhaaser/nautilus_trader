@@ -84,5 +84,8 @@ pub fn latency_model_any_to_pyobject(
 ) -> PyResult<Py<PyAny>> {
     match model {
         LatencyModelAny::Static(model) => model.clone().into_py_any(py),
+        LatencyModelAny::Handle(_) => Err(pyo3::exceptions::PyTypeError::new_err(
+            "a runtime latency model handle has no Python object",
+        )),
     }
 }

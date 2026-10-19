@@ -18,6 +18,7 @@
 pub mod config;
 pub mod ids_generator;
 pub mod inflight;
+pub mod outbound;
 
 mod settlement;
 

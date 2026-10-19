@@ -9369,3 +9369,93 @@ fn test_venue_clock_hold_rejects_a_post_only_bid_a_late_delta_crosses(
 
     context.client.stop().unwrap();
 }
+
+/// The model's event legs hold each order event the venue emits on its way back to the node:
+/// the acceptance waits its ack leg on the client's outbound alert, a submitted event (the node's
+/// own) goes at once, and stopping delivers whatever is still held, since the venue has applied it.
+#[rstest]
+fn test_event_latency_holds_venue_events_until_their_release(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    const ACK_NS: u64 = 2_000;
+    const FILL_NS: u64 = 7_000;
+
+    let latency = LatencyModelAny::Static(
+        StaticLatencyModel::new(
+            DurationNanos::ZERO,
+            DurationNanos::ZERO,
+            DurationNanos::ZERO,
+            DurationNanos::ZERO,
+        )
+        .with_event_latency(DurationNanos::new(FILL_NS), DurationNanos::new(ACK_NS)),
+    );
+    let (mut context, mut rx) =
+        setup_channel_context(trader_id, account_id, venue, &instrument, Some(latency));
+    let alert_name = format!("{}-sandbox-outbound-alert", context.client.client_id());
+
+    let ts = context.test_clock.borrow().timestamp_ns();
+    let order = resting_limit(&instrument, "O-EVENT-LATENCY-1", "100.00", ts);
+    submit_to_client(&context, trader_id, &order);
+    let kinds: Vec<&str> = apply_order_events_from_channel(&context.cache, &mut rx)
+        .iter()
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["submitted"],
+        "the acceptance must wait for its ack leg: {kinds:?}",
+    );
+    assert_eq!(
+        context.test_clock.borrow().next_time_ns(&alert_name),
+        Some(UnixNanos::from(*ts + ACK_NS)),
+    );
+
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(*ts + ACK_NS - 1)),
+        0
+    );
+    assert!(drain_order_events(&mut rx).is_empty());
+    assert_eq!(
+        advance_and_fire(&context.test_clock, UnixNanos::from(*ts + ACK_NS)),
+        1
+    );
+    let kinds: Vec<&str> = apply_order_events_from_channel(&context.cache, &mut rx)
+        .iter()
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["accepted"],
+        "released at its ack leg: {kinds:?}"
+    );
+    assert_eq!(cached_status(&context.cache, &order), OrderStatus::Accepted);
+    assert_eq!(
+        context.test_clock.borrow().next_time_ns(&alert_name),
+        None,
+        "nothing left held, so nothing armed",
+    );
+
+    // Held at stop: delivered then, not lost
+    let ts = context.test_clock.borrow().timestamp_ns();
+    let second = resting_limit(&instrument, "O-EVENT-LATENCY-2", "100.00", ts);
+    submit_to_client(&context, trader_id, &second);
+    let _ = apply_order_events_from_channel(&context.cache, &mut rx);
+    context.client.stop().unwrap();
+    let kinds: Vec<&str> = apply_order_events_from_channel(&context.cache, &mut rx)
+        .iter()
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["accepted"],
+        "stop delivers the held acceptance: {kinds:?}"
+    );
+    assert_eq!(
+        context.test_clock.borrow().next_time_ns(&alert_name),
+        None,
+        "stop cancels the outbound alert",
+    );
+}

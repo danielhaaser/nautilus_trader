@@ -19,6 +19,7 @@ use std::{
 };
 
 use nautilus_core::DurationNanos;
+use nautilus_model::events::OrderEventAny;
 
 /// Trait for latency models used in backtesting.
 ///
@@ -36,6 +37,16 @@ pub trait LatencyModel: Debug {
 
     /// Returns the base latency component.
     fn get_base_latency(&self) -> DurationNanos;
+
+    /// Returns how long `event`, emitted by the venue at its own instant, takes to reach the
+    /// trading node. The venue holds the event that long before the execution engine receives
+    /// it, and releases an order's events in the order it emitted them.
+    ///
+    /// The default is zero for every event: each one is delivered at the venue instant.
+    fn get_event_latency(&self, event: &OrderEventAny) -> DurationNanos {
+        let _ = event;
+        DurationNanos::ZERO
+    }
 }
 
 /// Shared runtime handle for a latency model.
@@ -83,35 +94,52 @@ impl LatencyModel for LatencyModelHandle {
     fn get_base_latency(&self) -> DurationNanos {
         self.0.get_base_latency()
     }
+
+    fn get_event_latency(&self, event: &OrderEventAny) -> DurationNanos {
+        self.0.get_event_latency(event)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum LatencyModelAny {
     Static(StaticLatencyModel),
+    /// Any runtime model, for a client configured with a model of its own.
+    Handle(LatencyModelHandle),
 }
 
 impl LatencyModel for LatencyModelAny {
     fn get_insert_latency(&self) -> DurationNanos {
         match self {
             Self::Static(model) => model.get_insert_latency(),
+            Self::Handle(model) => model.get_insert_latency(),
         }
     }
 
     fn get_update_latency(&self) -> DurationNanos {
         match self {
             Self::Static(model) => model.get_update_latency(),
+            Self::Handle(model) => model.get_update_latency(),
         }
     }
 
     fn get_delete_latency(&self) -> DurationNanos {
         match self {
             Self::Static(model) => model.get_delete_latency(),
+            Self::Handle(model) => model.get_delete_latency(),
         }
     }
 
     fn get_base_latency(&self) -> DurationNanos {
         match self {
             Self::Static(model) => model.get_base_latency(),
+            Self::Handle(model) => model.get_base_latency(),
+        }
+    }
+
+    fn get_event_latency(&self, event: &OrderEventAny) -> DurationNanos {
+        match self {
+            Self::Static(model) => model.get_event_latency(event),
+            Self::Handle(model) => model.get_event_latency(event),
         }
     }
 }
@@ -130,6 +158,9 @@ impl From<LatencyModelAny> for LatencyModelHandle {
 /// The base latency is automatically added to each operation latency, matching
 /// Python's behavior. For example, if `base_latency_nanos = 100ms` and
 /// `insert_latency_nanos = 200ms`, the effective insert latency will be 300ms.
+///
+/// Venue events reach the node at once unless [`StaticLatencyModel::with_event_latency`] sets a
+/// fill leg and an acknowledgement leg (the base latency is not added to them).
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
@@ -148,6 +179,8 @@ pub struct StaticLatencyModel {
     insert_latency_nanos: DurationNanos,
     update_latency_nanos: DurationNanos,
     delete_latency_nanos: DurationNanos,
+    fill_latency_nanos: DurationNanos,
+    ack_latency_nanos: DurationNanos,
 }
 
 impl StaticLatencyModel {
@@ -173,7 +206,23 @@ impl StaticLatencyModel {
             insert_latency_nanos: base_latency_nanos + insert_latency_nanos,
             update_latency_nanos: base_latency_nanos + update_latency_nanos,
             delete_latency_nanos: base_latency_nanos + delete_latency_nanos,
+            fill_latency_nanos: DurationNanos::ZERO,
+            ack_latency_nanos: DurationNanos::ZERO,
         }
+    }
+
+    /// Sets the venue-to-node legs of the venue's events: `fill_latency_nanos` for a fill, and
+    /// `ack_latency_nanos` for the venue's answer to a command (accepted, rejected, updated,
+    /// modify rejected, canceled, cancel rejected). Every other event reaches the node at once.
+    #[must_use]
+    pub fn with_event_latency(
+        mut self,
+        fill_latency_nanos: DurationNanos,
+        ack_latency_nanos: DurationNanos,
+    ) -> Self {
+        self.fill_latency_nanos = fill_latency_nanos;
+        self.ack_latency_nanos = ack_latency_nanos;
+        self
     }
 }
 
@@ -192,6 +241,19 @@ impl LatencyModel for StaticLatencyModel {
 
     fn get_base_latency(&self) -> DurationNanos {
         self.base_latency_nanos
+    }
+
+    fn get_event_latency(&self, event: &OrderEventAny) -> DurationNanos {
+        match event {
+            OrderEventAny::Filled(_) => self.fill_latency_nanos,
+            OrderEventAny::Accepted(_)
+            | OrderEventAny::Rejected(_)
+            | OrderEventAny::Updated(_)
+            | OrderEventAny::ModifyRejected(_)
+            | OrderEventAny::Canceled(_)
+            | OrderEventAny::CancelRejected(_) => self.ack_latency_nanos,
+            _ => DurationNanos::ZERO,
+        }
     }
 }
 
@@ -226,6 +288,79 @@ mod tests {
         fn get_base_latency(&self) -> DurationNanos {
             DurationNanos::new(44)
         }
+    }
+
+    fn event(kind: &str) -> OrderEventAny {
+        use nautilus_model::events::{
+            OrderAccepted, OrderCancelRejected, OrderCanceled, OrderExpired, OrderModifyRejected,
+            OrderRejected, OrderSubmitted, OrderUpdated, order::spec::OrderFilledSpec,
+        };
+        match kind {
+            "accepted" => OrderEventAny::Accepted(OrderAccepted::default()),
+            "rejected" => OrderEventAny::Rejected(OrderRejected::default()),
+            "updated" => OrderEventAny::Updated(OrderUpdated::default()),
+            "modify_rejected" => OrderEventAny::ModifyRejected(OrderModifyRejected::default()),
+            "canceled" => OrderEventAny::Canceled(OrderCanceled::default()),
+            "cancel_rejected" => OrderEventAny::CancelRejected(OrderCancelRejected::default()),
+            "filled" => OrderEventAny::Filled(OrderFilledSpec::builder().build()),
+            "submitted" => OrderEventAny::Submitted(OrderSubmitted::default()),
+            "expired" => OrderEventAny::Expired(OrderExpired::default()),
+            _ => unreachable!("{kind}"),
+        }
+    }
+
+    #[rstest]
+    fn test_event_latency_defaults_to_zero() {
+        let model = StaticLatencyModel::new(
+            DurationNanos::new(1),
+            DurationNanos::new(10),
+            DurationNanos::new(20),
+            DurationNanos::new(30),
+        );
+        assert_eq!(
+            model.get_event_latency(&event("filled")),
+            DurationNanos::ZERO
+        );
+        assert_eq!(
+            model.get_event_latency(&event("accepted")),
+            DurationNanos::ZERO
+        );
+        assert_eq!(
+            CustomLatencyModel.get_event_latency(&event("filled")),
+            DurationNanos::ZERO
+        );
+    }
+
+    #[rstest]
+    #[case("filled", 7)]
+    #[case("accepted", 2)]
+    #[case("rejected", 2)]
+    #[case("updated", 2)]
+    #[case("modify_rejected", 2)]
+    #[case("canceled", 2)]
+    #[case("cancel_rejected", 2)]
+    #[case("submitted", 0)]
+    #[case("expired", 0)]
+    fn test_static_event_latency_legs(#[case] kind: &str, #[case] expected: u64) {
+        let model = StaticLatencyModel::new(
+            DurationNanos::new(100),
+            DurationNanos::new(10),
+            DurationNanos::new(20),
+            DurationNanos::new(30),
+        )
+        .with_event_latency(DurationNanos::new(7), DurationNanos::new(2));
+        let any = LatencyModelAny::Static(model.clone());
+        let handle = LatencyModelHandle::new(model);
+        let wrapped = LatencyModelAny::Handle(handle.clone());
+
+        for latency in [
+            any.get_event_latency(&event(kind)),
+            handle.get_event_latency(&event(kind)),
+            wrapped.get_event_latency(&event(kind)),
+        ] {
+            assert_eq!(latency, DurationNanos::new(expected));
+        }
+        assert_eq!(wrapped.get_insert_latency(), DurationNanos::new(110));
     }
 
     #[rstest]

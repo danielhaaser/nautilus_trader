@@ -43,8 +43,16 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
-    matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
-    models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
+    matching_engine::{
+        OrderMatchingEngine,
+        inflight::InflightOrders,
+        outbound::{OutboundEvents, delaying_event_handler},
+    },
+    models::{
+        fee::FeeModelHandle,
+        fill::FillModelHandle,
+        latency::{LatencyModel, LatencyModelHandle},
+    },
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -159,6 +167,8 @@ impl SandboxExecutionClient {
                 next_engine_raw_id: 0,
                 balances,
                 event_handler: None,
+                outbound: OutboundEvents::default(),
+                outbound_deliver: None,
                 inbound_queue: BinaryHeap::new(),
                 inflight_orders: InflightOrders::default(),
                 inbound_seq: 0,
@@ -411,6 +421,35 @@ impl SandboxExecutionClient {
             .cancel_timer(&inbound_alert_name(client_id));
     }
 
+    fn cancel_outbound_alert(&self) {
+        let client_id = self.core.borrow().client_id;
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&outbound_alert_name(client_id));
+    }
+
+    /// Delivers every order event still held at stop, at once: the venue has applied them, so the
+    /// node's state must hold them too. Like the stop's rejections they take the execution channel.
+    fn flush_outbound_events(&self) {
+        self.cancel_outbound_alert();
+        let (outbound, deliver) = {
+            let inner = self.inner.borrow();
+            (inner.outbound.clone(), inner.outbound_deliver.clone())
+        };
+        let Some(deliver) = deliver else {
+            return;
+        };
+        if !outbound.is_empty() {
+            log::warn!(
+                "Delivering {} order event(s) still held for their event latency at stop",
+                outbound.len(),
+            );
+        }
+        while let Some(event) = outbound.pop_due(UnixNanos::max()) {
+            deliver(event);
+        }
+    }
+
     fn get_current_account_balances(&self) -> Vec<AccountBalance> {
         let account_id = self.core.borrow().account_id;
         let cache = self.cache.borrow();
@@ -554,8 +593,10 @@ impl SandboxExecutionClient {
         }
 
         inner.clear_inbound_queue();
+        inner.outbound.clear();
         inner.latest_ts_event.clear();
         self.cancel_inbound_alert();
+        self.cancel_outbound_alert();
 
         log::info!(
             "Sandbox execution client reset: venue={}",
@@ -646,12 +687,48 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        if let Some(sender) = try_get_exec_event_sender() {
+        let sender_handler = try_get_exec_event_sender().map(|sender| {
             let handler: Rc<dyn Fn(OrderEventAny)> = Rc::new(move |event: OrderEventAny| {
                 if let Err(e) = sender.send(ExecutionEvent::Order(event)) {
                     log::warn!("Failed to send order event: {e}");
                 }
             });
+            handler
+        });
+
+        // With a latency model, every order event leaves through the outbound queue, which holds
+        // it for its event leg and then delivers it as the plain handler would
+        let handler = match self.config.latency_model.clone() {
+            Some(latency_model) => {
+                let deliver: Rc<dyn Fn(OrderEventAny)> = sender_handler.unwrap_or_else(|| {
+                    Rc::new(|event| {
+                        msgbus::send_order_event(
+                            MessagingSwitchboard::exec_engine_process(),
+                            event,
+                        );
+                    })
+                });
+                let mut inner = self.inner.borrow_mut();
+                inner.outbound_deliver = Some(Rc::clone(&deliver));
+                let alert = OutboundAlert {
+                    clock: Rc::clone(&self.clock),
+                    outbound: inner.outbound.clone(),
+                    deliver: Rc::clone(&deliver),
+                    name: outbound_alert_name(self.core.borrow().client_id),
+                };
+                let on_held: Rc<dyn Fn(UnixNanos)> = Rc::new(move |_release| alert.arm());
+                Some(delaying_event_handler(
+                    inner.outbound.clone(),
+                    LatencyModelHandle::from(latency_model),
+                    Rc::clone(&self.clock),
+                    deliver,
+                    on_held,
+                ))
+            }
+            None => sender_handler,
+        };
+
+        if let Some(handler) = handler {
             let mut inner = self.inner.borrow_mut();
             inner.event_handler = Some(handler.clone());
             for engine in inner.matching_engines.values_mut() {
@@ -684,6 +761,7 @@ impl ExecutionClient for SandboxExecutionClient {
         self.deregister_message_handlers();
         self.cancel_expiry_sweep_timer();
         self.cancel_inbound_alert();
+        self.flush_outbound_events();
 
         // Rejections take the execution channel like every other event, so the engine stopping
         // this client processes them once its own borrow is released. Without a runner sender they
@@ -905,6 +983,11 @@ struct SandboxInner {
     /// Forwards order events to the runner's execution channel once `start` finds a sender; shared
     /// with every matching engine this client owns.
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
+    /// Order events the latency model's event leg holds on their way back to the node
+    /// ([`LatencyModel::get_event_latency`]); empty without a latency model.
+    outbound: OutboundEvents,
+    /// Where a held order event goes once released: the runner's channel, or the message bus.
+    outbound_deliver: Option<Rc<dyn Fn(OrderEventAny)>>,
     /// Inbound commands deferred by latency, ordered as a min-heap by due time.
     inbound_queue: BinaryHeap<DelayedCommand>,
     inflight_orders: InflightOrders,
@@ -1952,6 +2035,58 @@ impl SandboxInner {
 
 fn inbound_alert_name(client_id: ClientId) -> String {
     format!("{client_id}-sandbox-inbound-alert")
+}
+
+fn outbound_alert_name(client_id: ClientId) -> String {
+    format!("{client_id}-sandbox-outbound-alert")
+}
+
+/// The `LiveClock` alert that releases held order events at their release instants: armed for the
+/// earliest one held, it delivers every event due when it fires and re-arms for the next.
+#[derive(Clone)]
+struct OutboundAlert {
+    clock: Rc<RefCell<dyn Clock>>,
+    outbound: OutboundEvents,
+    deliver: Rc<dyn Fn(OrderEventAny)>,
+    name: String,
+}
+
+impl OutboundAlert {
+    /// (Re)arms the alert for the earliest release instant held, unless it is already armed no
+    /// later than that.
+    fn arm(&self) {
+        let Some(release) = self.outbound.next_release() else {
+            return;
+        };
+
+        let armed_ns = self.clock.borrow().next_time_ns(&self.name);
+        match armed_ns {
+            Some(armed_ns) if armed_ns <= release => return,
+            // Canceling first avoids the warning `replace_existing_timer` would log
+            Some(_) => self.clock.borrow_mut().cancel_timer(&self.name),
+            None => {}
+        }
+
+        let alert = self.clone();
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event: TimeEvent| {
+            // Retire the spent one-shot before re-arming reads it back as still armed
+            alert.clock.borrow_mut().cancel_timer(&alert.name);
+            let now_ns = alert.clock.borrow().timestamp_ns();
+            while let Some(event) = alert.outbound.pop_due(now_ns) {
+                (alert.deliver)(event);
+            }
+            alert.arm();
+        });
+
+        if let Err(e) = self.clock.borrow_mut().set_time_alert_ns(
+            &self.name,
+            release,
+            Some(TimeEventCallback::from(callback)),
+            Some(true),
+        ) {
+            log::error!("Failed to arm sandbox outbound alert '{}': {e}", self.name);
+        }
+    }
 }
 
 /// Returns the instrument whose market data `venue_clock_hold` waits on for `command`, or `None`

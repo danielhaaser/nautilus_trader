@@ -65,7 +65,8 @@ use nautilus_model::{
         TriggerType,
     },
     events::{
-        AccountState, OrderEventAny, OrderEventType, OrderFilled, OrderModifyRejected, OrderUpdated,
+        AccountState, OrderAccepted, OrderEventAny, OrderEventType, OrderFilled,
+        OrderModifyRejected, OrderUpdated,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
@@ -8162,4 +8163,186 @@ impl DataActor for TradeFillChain {
         }
         Ok(())
     }
+}
+
+/// Submits one market BUY on the first bar it sees, and records when (on its own clock) it
+/// learns its order was accepted and filled.
+struct RecordEventArrivals {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+    submit_on_bar: usize,
+    bars_seen: usize,
+    arrivals: Rc<RefCell<Vec<(&'static str, u64)>>>,
+}
+
+impl RecordEventArrivals {
+    fn new(
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        submit_on_bar: usize,
+        arrivals: Rc<RefCell<Vec<(&'static str, u64)>>>,
+    ) -> Self {
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("RECORD-ARRIVALS-001")),
+            order_id_tag: Some("001".to_string()),
+            ..Default::default()
+        };
+        Self {
+            core: StrategyCore::new(config),
+            instrument_id,
+            bar_type,
+            submit_on_bar,
+            bars_seen: 0,
+            arrivals,
+        }
+    }
+
+    fn record(&self, kind: &'static str) {
+        let now = self.clock().timestamp_ns().as_u64();
+        self.arrivals.borrow_mut().push((kind, now));
+    }
+}
+
+nautilus_strategy!(RecordEventArrivals, {
+    fn on_order_accepted(&mut self, _event: OrderAccepted) {
+        self.record("accepted");
+    }
+
+    fn on_order_filled(&mut self, _event: &OrderFilled) {
+        self.record("filled");
+    }
+});
+
+impl Debug for RecordEventArrivals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(RecordEventArrivals)).finish()
+    }
+}
+
+impl DataActor for RecordEventArrivals {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_bar(&mut self, _bar: &Bar) -> anyhow::Result<()> {
+        self.bars_seen += 1;
+        if self.bars_seen != self.submit_on_bar {
+            return Ok(());
+        }
+        let order = self.order().market(
+            self.instrument_id,
+            OrderSide::Buy,
+            Quantity::from("1.000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.submit_order(order, None, None, None)
+    }
+}
+
+#[rstest]
+// No event legs: the node learns of both at the venue instant, the bar's
+#[case::immediate(None, 1, vec![("accepted", 1_000_000_000), ("filled", 1_000_000_000)])]
+// The ack leg and the fill leg delay each event from the venue instant; the venue's own alert
+// releases them, long before the next bar
+#[case::delayed(Some((7, 2)), 1, vec![("accepted", 1_000_000_002), ("filled", 1_000_000_007)])]
+// A fill leg shorter than the ack leg does not overtake the order's acceptance
+#[case::order_kept(Some((1, 5)), 1, vec![("accepted", 1_000_000_005), ("filled", 1_000_000_005)])]
+// An order on the last bar: its events are held past the end, which still books the fill
+#[case::at_the_end(Some((7, 2)), 2, vec![])]
+fn test_event_latency_delays_venue_events_to_the_node(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] event_legs: Option<(u64, u64)>,
+    #[case] submit_on_bar: usize,
+    #[case] expected: Vec<(&'static str, u64)>,
+) {
+    let instrument_id = crypto_perpetual_ethusdt.id;
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+        AggregationSource::External,
+    );
+    let bars = [("1001.00", 1_000_000_000_u64), ("2001.00", 2_000_000_000)]
+        .into_iter()
+        .map(|(price, ts)| {
+            let price = Price::from(price);
+            Data::Bar(Bar::new(
+                bar_type,
+                price,
+                price,
+                price,
+                price,
+                Quantity::from("10.000"),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // No command leg, so the order reaches the venue at the bar that sent it
+    let mut latency = StaticLatencyModel::new(
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
+        DurationNanos::default(),
+    );
+    if let Some((fill, ack)) = event_legs {
+        latency = latency.with_event_latency(DurationNanos::new(fill), DurationNanos::new(ack));
+    }
+
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .latency_model(LatencyModelHandle::new(latency))
+                .use_market_order_acks(true)
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine
+        .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+    engine.add_data(bars, None, true, true).unwrap();
+    let arrivals = Rc::new(RefCell::new(Vec::new()));
+    engine
+        .add_strategy(RecordEventArrivals::new(
+            instrument_id,
+            bar_type,
+            submit_on_bar,
+            Rc::clone(&arrivals),
+        ))
+        .unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    // At the end the strategy is stopped before the events' release, so it records nothing
+    assert_eq!(*arrivals.borrow(), expected);
+
+    let cache_rc = engine.kernel().cache();
+    let cache = cache_rc.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    // The fill carries the venue instant, whenever the node learns of it
+    let venue_instant = if submit_on_bar == 2 {
+        2_000_000_000
+    } else {
+        1_000_000_000
+    };
+    assert_eq!(
+        positions[0].events[0].ts_event,
+        UnixNanos::from(venue_instant)
+    );
 }

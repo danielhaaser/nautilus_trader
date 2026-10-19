@@ -30,6 +30,7 @@ use nautilus_common::{
     clock::{Clock, VirtualClock},
     messages::execution::{ModifyOrder, TradingCommand},
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
+    timer::TimeEvent,
 };
 use nautilus_core::{
     DurationNanos, UUID4, UnixNanos,
@@ -38,8 +39,10 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{
-        IterateWork, OrderMatchingEngine, config::OrderMatchingEngineConfig,
+        IterateWork, OrderMatchingEngine,
+        config::OrderMatchingEngineConfig,
         inflight::InflightOrders,
+        outbound::{OutboundEvents, delaying_event_handler},
     },
     models::{
         fee::FeeModelHandle,
@@ -160,6 +163,12 @@ pub struct SimulatedExchange {
     /// panic. Outside it (market data, iteration, expiration, liquidation, open-order
     /// loading) events dispatch directly, so immediate mode keeps its synchronous timing.
     deferring_events: Rc<Cell<bool>>,
+    /// Order events the latency model holds on their way back to the node.
+    outbound: OutboundEvents,
+    /// The handler matching engines and the exchange emit order events through when a latency
+    /// model is set: it holds each event for its event latency, then delivers it as
+    /// `event_handler` would.
+    outbound_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
     fee_model: FeeModelHandle,
     fill_model: FillModelHandle,
     latency_model: Option<LatencyModelHandle>,
@@ -431,7 +440,7 @@ impl SimulatedExchange {
             }
         });
 
-        Ok(Self {
+        let mut exchange = Self {
             id: config.venue,
             oms_type: config.oms_type,
             account_type: config.account_type,
@@ -442,6 +451,8 @@ impl SimulatedExchange {
             exec_client: None,
             event_handler: None,
             deferring_events: Rc::new(Cell::new(false)),
+            outbound: OutboundEvents::default(),
+            outbound_handler: None,
             fee_model: config.fee_model,
             fill_model: config.fill_model,
             latency_model: config.latency_model,
@@ -488,7 +499,9 @@ impl SimulatedExchange {
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
             liquidation_cancel_open_orders: config.liquidation_cancel_open_orders,
-        })
+        };
+        exchange.refresh_event_handlers();
+        Ok(exchange)
     }
 
     /// Registers the execution client for the exchange.
@@ -523,6 +536,81 @@ impl SimulatedExchange {
     /// Sets the latency model for the exchange.
     pub fn set_latency_model(&mut self, latency_model: LatencyModelHandle) {
         self.latency_model = Some(latency_model);
+        self.refresh_event_handlers();
+    }
+
+    /// Rebuilds the handler order events leave the venue through, and gives it to every
+    /// matching engine: with a latency model, each event is held for its event latency
+    /// ([`LatencyModel::get_event_latency`]) and then delivered through `event_handler`;
+    /// without one, engines deliver through `event_handler` directly, as before.
+    fn refresh_event_handlers(&mut self) {
+        self.outbound_handler = self.latency_model.clone().map(|model| {
+            let deliver: Rc<dyn Fn(OrderEventAny)> = match &self.event_handler {
+                Some(handler) => Rc::clone(handler),
+                None => Rc::new(|event| {
+                    msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+                }),
+            };
+            let clock = Rc::clone(&self.clock);
+            let alert_prefix = format!("SimulatedExchange.event_release.{}.", self.id);
+            // Wakes the engine at the release instant: the engine settles the venues after every
+            // timer, and settlement releases what is due (`process_commands`)
+            let on_held: Rc<dyn Fn(UnixNanos)> = Rc::new(move |release: UnixNanos| {
+                let name = format!("{alert_prefix}{release}");
+                let mut clock = clock.borrow_mut();
+                if clock.next_time_ns(&name).is_some() {
+                    return;
+                }
+                let noop: Rc<dyn Fn(TimeEvent)> = Rc::new(|_event: TimeEvent| {});
+                if let Err(e) =
+                    clock.set_time_alert_ns(&name, release, Some(noop.into()), Some(true))
+                {
+                    log::error!("Failed to arm the event release alert {name}: {e}");
+                }
+            });
+            delaying_event_handler(
+                self.outbound.clone(),
+                model,
+                Rc::clone(&self.clock),
+                deliver,
+                on_held,
+            )
+        });
+
+        if let Some(handler) = self.engine_event_handler() {
+            for matching_engine in self.matching_engines.values_mut() {
+                matching_engine.set_event_handler(Rc::clone(&handler));
+            }
+        }
+    }
+
+    /// The handler a matching engine emits order events through, if any.
+    fn engine_event_handler(&self) -> Option<Rc<dyn Fn(OrderEventAny)>> {
+        self.outbound_handler
+            .clone()
+            .or_else(|| self.event_handler.clone())
+    }
+
+    /// Delivers every held order event due at or before `ts_now`, in release order.
+    fn release_due_events(&self, ts_now: UnixNanos) {
+        while let Some(event) = self.outbound.pop_due(ts_now) {
+            match &self.event_handler {
+                Some(handler) => handler(event),
+                None => {
+                    msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
+                }
+            }
+        }
+    }
+
+    /// Returns the latest release instant of the order events the latency model holds, or
+    /// `None` when none is held.
+    ///
+    /// Used at shutdown, beside [`Self::max_inflight_command_ts`], so the events of the final
+    /// instant reach the node before the engines stop.
+    #[must_use]
+    pub fn max_outbound_event_ts(&self) -> Option<UnixNanos> {
+        self.outbound.last_release()
     }
 
     #[must_use]
@@ -738,8 +826,8 @@ impl SimulatedExchange {
             matching_engine_config,
         );
 
-        if let Some(handler) = &self.event_handler {
-            matching_engine.set_event_handler(Rc::clone(handler));
+        if let Some(handler) = self.engine_event_handler() {
+            matching_engine.set_event_handler(handler);
         }
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
         matching_engine
@@ -860,10 +948,8 @@ impl SimulatedExchange {
             }
         });
 
-        for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.set_event_handler(Rc::clone(&gated));
-        }
         self.event_handler = Some(gated);
+        self.refresh_event_handlers();
     }
 
     /// Returns the best bid price for the given instrument, if available.
@@ -1095,7 +1181,7 @@ impl SimulatedExchange {
     /// Returns whether there are pending commands at or before `ts_now`.
     #[must_use]
     pub fn has_pending_commands(&self, ts_now: UnixNanos) -> bool {
-        if !self.message_queue.is_empty() {
+        if !self.message_queue.is_empty() || self.outbound.has_due(ts_now) {
             return true;
         }
         self.inflight_queue
@@ -1112,7 +1198,8 @@ impl SimulatedExchange {
             return self.has_pending_commands(ts_now);
         }
 
-        if !self.message_queue.is_empty() {
+        // A held order event due now is released whatever the scope (`process_commands`)
+        if !self.message_queue.is_empty() || self.outbound.has_due(ts_now) {
             return true;
         }
 
@@ -2011,6 +2098,9 @@ impl SimulatedExchange {
     fn process_commands(&mut self, ts_now: UnixNanos, scope: SettlementScope) {
         self.set_clock_time(ts_now);
 
+        // Order events due by now reach the node before the commands arriving now are applied
+        self.release_due_events(ts_now);
+
         let mut deferred = Vec::new();
         let mut processed_timestamps = BTreeSet::new();
 
@@ -2141,6 +2231,7 @@ impl SimulatedExchange {
         self.inflight_queue.clear();
         self.inflight_orders.clear();
         self.inflight_counter.clear();
+        self.outbound.clear();
 
         log::info!("Resetting exchange state");
         self.module_error = module_error;
@@ -2429,7 +2520,7 @@ impl SimulatedExchange {
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
-        if let Some(handler) = &self.event_handler {
+        if let Some(handler) = self.engine_event_handler() {
             handler(event);
         } else {
             msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), event);
