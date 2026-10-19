@@ -150,7 +150,7 @@ impl BacktestDataIterator {
 #[cfg(test)]
 mod tests {
     use nautilus_model::{
-        data::QuoteTick,
+        data::{HasTsInit, QuoteTick},
         identifiers::InstrumentId,
         types::{Price, Quantity},
     };

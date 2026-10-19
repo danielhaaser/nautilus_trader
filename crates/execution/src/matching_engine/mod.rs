@@ -2681,7 +2681,7 @@ impl OrderMatchingEngine {
     /// - no bid/ask/last override is pending, and the core's bid and ask already equal the book's
     ///   best prices (raw value and precision), so the opening refresh (either book type) and the
     ///   closing restore assign what is already there;
-    /// - the four purge collections are empty, so the purges remove nothing;
+    /// - the five purge collections are empty, so the purges remove nothing;
     /// - no instrument close is held, and the expiration check returns before acting: expiration
     ///   processed, option settlement failed, the expiration not yet reached (`IdleUntil`), or a
     ///   binary option already pending resolution (re-entering it returns at once).
@@ -2700,8 +2700,9 @@ impl OrderMatchingEngine {
             && self.target_ask.is_none()
             && self.target_last.is_none()
             && self.cached_filled_qty.is_empty()
-            && self.pending_order_updates.borrow().is_empty()
+            && self.pending_updates.borrow().is_empty()
             && self.rejected_oto_parent_ids.borrow().is_empty()
+            && self.canceled_oto_order_ids.is_empty()
             && self.pending_fills.is_empty()
             && self.instrument_close.is_none()
             && same_price(self.core.bid, self.book.best_bid_price())
@@ -13103,7 +13104,7 @@ mod tests {
             engine.option_settlement_failed,
             engine.option_expiration_orders_canceled,
             engine.cached_filled_qty,
-            engine.pending_order_updates.borrow(),
+            engine.pending_updates.borrow(),
             engine.pending_fills.keys().collect::<Vec<_>>(),
             engine.post_match_order_ids,
             engine.rejected_oto_parent_ids.borrow(),
