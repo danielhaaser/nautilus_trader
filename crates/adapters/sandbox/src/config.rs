@@ -152,6 +152,9 @@ pub struct SandboxExecutionClientConfig {
     /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
     #[builder(default = true)]
     pub book_cross_fills: bool,
+    /// How far back a trade reaches for the book deltas that reflect it, so a trade arriving after
+    /// them is processed ahead of them (`OrderMatchingEngineConfig::trade_reflection_window`).
+    pub trade_reflection_window: Option<DurationNanos>,
     /// If order book liquidity consumption should be tracked per level.
     #[builder(default)]
     pub liquidity_consumption: bool,
@@ -195,6 +198,7 @@ impl SandboxExecutionClientConfig {
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
             .book_cross_fills(self.book_cross_fills)
+            .maybe_trade_reflection_window(self.trade_reflection_window)
             .oto_full_trigger(self.oto_full_trigger)
             .maybe_price_protection_points(price_protection)
             .build()

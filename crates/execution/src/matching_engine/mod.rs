@@ -25,6 +25,7 @@ mod settlement;
 use std::{
     cell::RefCell,
     cmp::min,
+    collections::VecDeque,
     fmt::Debug,
     mem,
     ops::{Add, Sub},
@@ -148,6 +149,8 @@ pub struct OrderMatchingEngine {
     queue_pending_scratch: Vec<(ClientOrderId, PriceRaw)>,
     queue_stale_scratch: Vec<ClientOrderId>,
     queue_entry_scratch: Vec<(ClientOrderId, QuantityRaw, QuantityRaw)>,
+    queue_cuts: IndexMap<(OrderSide, PriceRaw), VecDeque<QueueCut>>,
+    unreflected_trades: IndexMap<(OrderSide, PriceRaw), VecDeque<(UnixNanos, QuantityRaw)>>,
     prev_bid_price_raw: PriceRaw,
     prev_ask_price_raw: PriceRaw,
     tob_initialized: bool,
@@ -169,6 +172,18 @@ impl Debug for OrderMatchingEngine {
             .field("instrument", &self.instrument.id())
             .finish()
     }
+}
+
+/// A level reduction a book delta made at a price where queue positions are tracked
+/// (`OrderMatchingEngineConfig::trade_reflection_window`).
+#[derive(Debug)]
+struct QueueCut {
+    /// The delta's venue stamp.
+    ts_event: UnixNanos,
+    /// The size the delta took off the level that no trade has claimed yet.
+    remaining: QuantityRaw,
+    /// The queue ahead each order lost to the delta, given back once to the trade that claims it.
+    cuts: Vec<(ClientOrderId, QuantityRaw)>,
 }
 
 /// What a later [`OrderMatchingEngine::iterate`] with no aggressor would do to an engine that
@@ -262,6 +277,8 @@ impl OrderMatchingEngine {
             queue_pending_scratch: Vec::new(),
             queue_stale_scratch: Vec::new(),
             queue_entry_scratch: Vec::new(),
+            queue_cuts: IndexMap::new(),
+            unreflected_trades: IndexMap::new(),
             prev_bid_price_raw: 0,
             prev_ask_price_raw: 0,
             tob_initialized: false,
@@ -338,6 +355,8 @@ impl OrderMatchingEngine {
         self.queue_pending_scratch.clear();
         self.queue_stale_scratch.clear();
         self.queue_entry_scratch.clear();
+        self.queue_cuts.clear();
+        self.unreflected_trades.clear();
         self.prev_bid_price_raw = 0;
         self.prev_ask_price_raw = 0;
         self.tob_initialized = false;
@@ -666,6 +685,13 @@ impl OrderMatchingEngine {
         self.queue_ahead_orders.shift_remove(&client_order_id);
         self.queue_excess.shift_remove(&client_order_id);
 
+        // A queue a delta took from the order's old position is not its new position's to get back
+        for level in self.queue_cuts.values_mut() {
+            for cut in level.iter_mut() {
+                cut.cuts.retain(|(id, _)| *id != client_order_id);
+            }
+        }
+
         for price_raw in [pending_price, ahead_price].into_iter().flatten() {
             let remove_price = self
                 .queue_ids_by_price
@@ -897,6 +923,10 @@ impl OrderMatchingEngine {
             return;
         }
 
+        // A replaced book's earlier reductions are not the queue the estimates now carry
+        self.queue_cuts.clear();
+        self.unreflected_trades.clear();
+
         let tracked: Vec<_> = self
             .queue_ahead_total
             .iter()
@@ -991,6 +1021,255 @@ impl OrderMatchingEngine {
                 );
             }
         }
+    }
+
+    /// Whether trades are processed ahead of the deltas that reflect them
+    /// (`OrderMatchingEngineConfig::trade_reflection_window`).
+    fn trade_reflection_window(&self) -> Option<u64> {
+        if !self.config.queue_position || self.book_type != BookType::L2_MBP {
+            return None;
+        }
+        self.config
+            .trade_reflection_window
+            .map(|window| window.as_u64())
+    }
+
+    /// The size each of `deltas` takes off a level where an order's queue is tracked, read from the
+    /// book before the deltas apply (`0` for any other delta), or nothing when trades are not
+    /// reflected.
+    fn tracked_level_cuts(&self, deltas: &[OrderBookDelta]) -> Vec<QuantityRaw> {
+        if self.trade_reflection_window().is_none() {
+            return Vec::new();
+        }
+
+        let size_precision = self.instrument.size_precision();
+        let mut sizes: IndexMap<(OrderSide, PriceRaw), QuantityRaw> = IndexMap::new();
+        let mut cleared = false;
+
+        deltas
+            .iter()
+            .map(|delta| {
+                if delta.action == BookAction::Clear {
+                    sizes.clear();
+                    cleared = true;
+                    return 0;
+                }
+                let Some(side) = delta.order.side else {
+                    return 0;
+                };
+                let price = delta.order.price;
+                if !self.queue_ids_by_price.contains_key(&price.raw()) {
+                    return 0;
+                }
+
+                let key = (side, price.raw());
+                let before = match sizes.get(&key) {
+                    Some(&size) => size,
+                    None if cleared => 0,
+                    // Pass the opposite side: the lookup flips it to the resting side
+                    None => self
+                        .book
+                        .get_quantity_at_level(
+                            price,
+                            OrderCore::opposite_side(side),
+                            size_precision,
+                        )
+                        .raw(),
+                };
+                let after = match delta.action {
+                    BookAction::Delete => 0,
+                    _ => delta.order.size.raw(),
+                };
+                sizes.insert(key, after);
+                before.saturating_sub(after)
+            })
+            .collect()
+    }
+
+    /// [`Self::adjust_queue_for_delta`], keeping the queue it takes from each order when the delta
+    /// reduced a tracked level (`cut`, from [`Self::tracked_level_cuts`]), so a trade that arrives
+    /// after it can be processed ahead of it ([`Self::reflect_trade`]).
+    fn adjust_queue_for_delta_recorded(
+        &mut self,
+        delta: &OrderBookDelta,
+        cut: Option<QuantityRaw>,
+    ) {
+        let (Some(window), Some(cut), Some(side)) = (
+            self.trade_reflection_window(),
+            cut.filter(|cut| *cut > 0),
+            delta.order.side,
+        ) else {
+            self.adjust_queue_for_delta(delta);
+            return;
+        };
+
+        let price_raw = delta.order.price.raw();
+        // Read before the delta adjusts the queue, which needs `self` mutably
+        let mut before: Vec<(ClientOrderId, QuantityRaw)> = Vec::new();
+        before.extend(
+            self.queue_ids_by_price
+                .get(&price_raw)
+                .into_iter()
+                .flatten()
+                .filter_map(
+                    |client_order_id| match self.queue_ahead_total.get(client_order_id) {
+                        Some(&(order_price_raw, ahead_raw)) if order_price_raw == price_raw => {
+                            Some((*client_order_id, ahead_raw))
+                        }
+                        _ => None,
+                    },
+                ),
+        );
+
+        self.adjust_queue_for_delta(delta);
+
+        let cuts: Vec<(ClientOrderId, QuantityRaw)> = before
+            .into_iter()
+            .filter_map(|(client_order_id, ahead_raw)| {
+                let after = self
+                    .queue_ahead_total
+                    .get(&client_order_id)
+                    .map_or(ahead_raw, |&(_, after)| after);
+                (after < ahead_raw).then_some((client_order_id, ahead_raw - after))
+            })
+            .collect();
+
+        let ts_event = delta.ts_event;
+        let key = (side, price_raw);
+
+        // Trades already processed ahead of this delta claim its size first: what they claim gives
+        // back nothing, since they already ran before it
+        let mut remaining = cut;
+        if let Some(pending) = self.unreflected_trades.get_mut(&key) {
+            pending.retain(|(ts, _)| ts.as_u64() + window >= ts_event.as_u64());
+            for (ts, need) in pending.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                if *ts < ts_event {
+                    continue;
+                }
+                let take = remaining.min(*need);
+                *need -= take;
+                remaining -= take;
+            }
+            pending.retain(|(_, need)| *need > 0);
+            if pending.is_empty() {
+                self.unreflected_trades.shift_remove(&key);
+            }
+        }
+
+        if remaining == 0 {
+            return;
+        }
+
+        let level = self.queue_cuts.entry(key).or_default();
+        while level
+            .front()
+            .is_some_and(|old| old.ts_event.as_u64() + window < ts_event.as_u64())
+        {
+            level.pop_front();
+        }
+        level.push_back(QueueCut {
+            ts_event,
+            remaining,
+            cuts,
+        });
+    }
+
+    /// Before a trade is processed: gives back the queue taken by the deltas that, on the venue's
+    /// clock, the trade came ahead of — every tracked reduction at its price on the resting side
+    /// stamped after it (at most the window later), and those stamped at or before it (at most
+    /// the window earlier) that it claims, newest first, until its size is covered. A size it
+    /// cannot cover waits for the reductions still to arrive. Returns the resting side when the
+    /// trade can reflect a delta, so the level's queue is capped again once it is processed
+    /// ([`Self::recap_queue_at_level`]).
+    fn reflect_trade(
+        &mut self,
+        price_raw: PriceRaw,
+        size_raw: QuantityRaw,
+        aggressor_side: AggressorSide,
+        ts_event: UnixNanos,
+    ) -> Option<OrderSide> {
+        let window = self.trade_reflection_window()?;
+        let resting_side = match aggressor_side {
+            AggressorSide::Buy => OrderSide::Sell,
+            AggressorSide::Sell => OrderSide::Buy,
+            AggressorSide::NoAggressor => return None,
+        };
+        let key = (resting_side, price_raw);
+
+        let mut restore: Vec<(ClientOrderId, QuantityRaw)> = Vec::new();
+        let mut need = size_raw;
+
+        if let Some(level) = self.queue_cuts.get_mut(&key) {
+            level.retain(|cut| cut.ts_event.as_u64() + window >= ts_event.as_u64());
+
+            for cut in level.iter_mut().filter(|cut| {
+                cut.ts_event > ts_event && cut.ts_event.as_u64() <= ts_event.as_u64() + window
+            }) {
+                restore.append(&mut cut.cuts);
+            }
+
+            for cut in level
+                .iter_mut()
+                .rev()
+                .filter(|cut| cut.ts_event <= ts_event)
+            {
+                if need == 0 {
+                    break;
+                }
+                let take = need.min(cut.remaining);
+                if take == 0 {
+                    continue;
+                }
+                cut.remaining -= take;
+                need -= take;
+                restore.append(&mut cut.cuts);
+            }
+
+            level.retain(|cut| cut.remaining > 0);
+            if level.is_empty() {
+                self.queue_cuts.shift_remove(&key);
+            }
+        }
+
+        if need > 0 && self.queue_ids_by_price.contains_key(&price_raw) {
+            let pending = self.unreflected_trades.entry(key).or_default();
+            while pending
+                .front()
+                .is_some_and(|(ts, _)| ts.as_u64() + window < ts_event.as_u64())
+            {
+                pending.pop_front();
+            }
+            pending.push_back((ts_event, need));
+        }
+
+        for (client_order_id, cut_raw) in restore {
+            if let Some((order_price_raw, ahead_raw)) =
+                self.queue_ahead_total.get_mut(&client_order_id)
+                && *order_price_raw == price_raw
+            {
+                *ahead_raw += cut_raw;
+            }
+        }
+
+        Some(resting_side)
+    }
+
+    /// After a trade [`Self::reflect_trade`] processed: caps the queue at its level at the level's
+    /// current size again, as the deltas it came ahead of did.
+    fn recap_queue_at_level(&mut self, price_raw: PriceRaw, resting_side: OrderSide) {
+        let price = Price::from_raw(price_raw, self.instrument.price_precision());
+        let size_raw = self
+            .book
+            .get_quantity_at_level(
+                price,
+                OrderCore::opposite_side(resting_side),
+                self.instrument.size_precision(),
+            )
+            .raw();
+        self.cap_queue_ahead(price_raw, size_raw, Some(resting_side));
     }
 
     fn clear_queue_on_delete(
@@ -1656,6 +1935,7 @@ impl OrderMatchingEngine {
             return Ok(());
         }
 
+        let cuts = self.tracked_level_cuts(std::slice::from_ref(delta));
         self.book.apply_delta(delta)?;
 
         let is_snapshot = RecordFlag::F_SNAPSHOT.matches(delta.flags);
@@ -1677,7 +1957,7 @@ impl OrderMatchingEngine {
             } else if is_clear && !is_snapshot {
                 self.rebase_queue_positions();
             } else if !self.queue_snapshot_in_progress {
-                self.adjust_queue_for_delta(delta);
+                self.adjust_queue_for_delta_recorded(delta, cuts.first().copied());
             }
         }
 
@@ -1714,18 +1994,19 @@ impl OrderMatchingEngine {
             return Ok(());
         }
 
+        let cuts = self.tracked_level_cuts(&deltas.deltas);
         self.book.apply_deltas(deltas)?;
 
         let mut has_snapshot_or_clear = false;
 
         if self.config.queue_position {
-            for delta in &deltas.deltas {
+            for (i, delta) in deltas.deltas.iter().enumerate() {
                 if RecordFlag::F_SNAPSHOT.matches(delta.flags) || delta.action == BookAction::Clear
                 {
                     has_snapshot_or_clear = true;
                     break;
                 }
-                self.adjust_queue_for_delta(delta);
+                self.adjust_queue_for_delta_recorded(delta, cuts.get(i).copied());
             }
         }
 
@@ -2496,12 +2777,18 @@ impl OrderMatchingEngine {
             );
         }
 
+        let reflected =
+            self.reflect_trade(price_raw, trade.size.raw(), aggressor_side, trade.ts_event);
         self.resolve_pending_on_trade(price_raw);
         self.decrement_queue_on_trade(price_raw, trade.size.raw(), aggressor_side);
 
         self.iterate(trade.ts_init, aggressor_side);
 
         self.finish_trade_iteration();
+
+        if let Some(resting_side) = reflected {
+            self.recap_queue_at_level(price_raw, resting_side);
+        }
 
         // Restore the non-aggressor side after temporary trade price override.
         // For L2/L3 books the book has independent depth so restore from originals.

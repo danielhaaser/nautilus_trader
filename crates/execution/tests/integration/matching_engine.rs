@@ -33,7 +33,7 @@ use nautilus_common::{
         stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
     },
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_execution::{
     engine::ExecutionEngine,
     matching_engine::{
@@ -8967,6 +8967,129 @@ fn test_book_cross_fills_switch_leaves_a_crossed_resting_order_to_the_trades(
     // A buyer lifting at the ask's price fills it, as much as it printed.
     engine_l2.process_trade_tick(&trade("1000.00", "40.000", AggressorSide::Buy, "T-2", 3));
     assert_eq!(fills(&order_event_handler), [Quantity::from("40.000")]);
+}
+
+/// `trade_reflection_window`: a venue that publishes a trade and the delta reflecting it on
+/// separate channels often delivers the delta first. Each pair here shares one venue stamp. In the
+/// venue's order (trade first) a resting ask with 100 ahead of it sees 20 and 70 print, which
+/// leave 10 ahead, so it fills nothing; a last 15 lifted as its level empties fills it 5. Delivered
+/// delta first, each delta caps the queue and its trade eats it again: with no window the 70 fills
+/// the whole ask (30) past the 10 still ahead of it; with the window the engine processes each
+/// trade ahead of its delta and fills exactly what the venue's order fills.
+#[rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+fn test_trade_reflection_window_counts_a_print_once_against_the_queue(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] delta_first: bool,
+    #[case] window: bool,
+) {
+    let config = OrderMatchingEngineConfig {
+        liquidity_consumption: true,
+        queue_position: true,
+        book_cross_fills: false,
+        trade_reflection_window: window.then(|| DurationNanos::from_millis(250)),
+        ..Default::default()
+    };
+    let mut engine_l2 =
+        get_order_matching_engine_l2(instrument_eth_usdt.clone(), None, None, None, Some(config));
+
+    let level = |action: BookAction, side: OrderSide, price: &str, size: &str, ts: u64| {
+        OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+            .book_action(action)
+            .book_order(BookOrder::new(
+                side,
+                Price::from(price),
+                Quantity::from(size),
+                0,
+            ))
+            .ts_event(UnixNanos::from(ts))
+            .ts_init(UnixNanos::from(ts))
+            .build()
+    };
+    let trade = |size: &str, id: &str, ts: u64| {
+        TradeTick::new(
+            instrument_eth_usdt.id(),
+            Price::from("1000.00"),
+            Quantity::from(size),
+            AggressorSide::Buy,
+            TradeId::new(id),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        )
+    };
+    engine_l2
+        .process_order_book_delta(&level(
+            BookAction::Add,
+            OrderSide::Buy,
+            "900.00",
+            "100.000",
+            1,
+        ))
+        .unwrap();
+    engine_l2
+        .process_order_book_delta(&level(
+            BookAction::Add,
+            OrderSide::Sell,
+            "1000.00",
+            "100.000",
+            1,
+        ))
+        .unwrap();
+
+    let mut resting_ask = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Sell)
+        .price(Price::from("1000.00"))
+        .quantity(Quantity::from("30.000"))
+        .post_only(true)
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+        .submit(true)
+        .build();
+    engine_l2.process_order(&mut resting_ask, account_id);
+    clear_order_event_handler_messages(&order_event_handler);
+
+    let pairs = [
+        ("20.000", BookAction::Update, "80.000", 10),
+        ("70.000", BookAction::Update, "10.000", 20),
+        ("15.000", BookAction::Delete, "0.000", 30),
+    ];
+    for (n, (size, action, left, ts)) in pairs.into_iter().enumerate() {
+        let delta = level(action, OrderSide::Sell, "1000.00", left, ts);
+        let print = trade(size, &format!("T-{n}"), ts);
+        if delta_first {
+            engine_l2.process_order_book_delta(&delta).unwrap();
+            engine_l2.process_trade_tick(&print);
+        } else {
+            engine_l2.process_trade_tick(&print);
+            engine_l2.process_order_book_delta(&delta).unwrap();
+        }
+    }
+
+    let filled: Vec<Quantity> = get_order_event_handler_messages(&order_event_handler)
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill.last_qty),
+            _ => None,
+        })
+        .collect();
+    if delta_first && !window {
+        assert_eq!(
+            filled,
+            [Quantity::from("30.000")],
+            "each print counted twice: the 70 filled the ask past the 10 ahead of it"
+        );
+    } else {
+        assert_eq!(
+            filled,
+            [Quantity::from("5.000")],
+            "the venue's order: 20 and 70 leave 10 ahead, the last 15 fills 5"
+        );
+    }
 }
 
 #[rstest]

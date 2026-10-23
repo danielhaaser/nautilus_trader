@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::DurationNanos;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for `OrderMatchingEngine` instances.
@@ -57,6 +58,21 @@ pub struct OrderMatchingEngineConfig {
     /// order) are unaffected.
     #[builder(default = true)]
     pub book_cross_fills: bool,
+    /// How far back, on the venue's clock, a trade reaches for the book deltas that reflect it.
+    ///
+    /// A venue can publish a trade and the delta that removes its size from the book on channels
+    /// not ordered with each other, so the delta often arrives first. With `queue_position` on an
+    /// `L2_MBP` book, that delta caps the queue ahead of an order at the level and the trade then
+    /// eats the queue again: each print counts twice. With a window set, the engine keeps the
+    /// queue each level reduction took from each order, and processes a trade as if it arrived
+    /// ahead of the deltas that reflect it: the reductions at its price on the resting side
+    /// stamped at or before it, at most the window earlier, newest first, until its size is
+    /// covered, and every reduction stamped after it, at most the window later. Their queue is
+    /// given back, the trade decrements the queue and fills as usual, then the queue is capped
+    /// again at the level's current size. A reduction arriving after a trade that covers it gives
+    /// nothing back.
+    /// `None` (the default) processes data in arrival order.
+    pub trade_reflection_window: Option<DurationNanos>,
     #[builder(default)]
     pub oto_full_trigger: bool,
     #[builder(default)]
@@ -94,6 +110,7 @@ mod tests {
         assert!(!config.queue_position);
         assert!(!config.oto_full_trigger);
         assert!(!config.defer_option_settlement);
+        assert_eq!(config.trade_reflection_window, None);
         assert_eq!(config.price_protection_points, None);
     }
 }
