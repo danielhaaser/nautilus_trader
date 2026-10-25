@@ -20,7 +20,10 @@ use std::{
     collections::BinaryHeap,
 };
 
-use nautilus_common::{clock::VirtualClock, timer::TimeEventHandler};
+use nautilus_common::{
+    clock::{Clock, VirtualClock},
+    timer::TimeEventHandler,
+};
 use nautilus_core::UnixNanos;
 
 /// Provides a means of accumulating and draining time event handlers using a priority queue.
@@ -93,7 +96,40 @@ impl TimeEventAccumulator {
     }
 
     /// Advance the given clock to the `to_time_ns` and push events to the heap.
+    ///
+    /// When no timer entry is due by `to_time_ns` and the clock's time is not to be set, the
+    /// clock's advance would return no event and change nothing, so it is skipped (its
+    /// non-decreasing-time check is kept). [`Self::advance_clock_reference`] always advances.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `to_time_ns` is earlier than the clock's time, as the clock's advance does.
     pub fn advance_clock(
+        &mut self,
+        clock: &mut VirtualClock,
+        to_time_ns: UnixNanos,
+        set_time: bool,
+    ) {
+        if !set_time
+            && clock
+                .next_scheduled_ns()
+                .is_none_or(|next_ns| next_ns > to_time_ns)
+        {
+            let from_time_ns = clock.timestamp_ns();
+            assert!(
+                to_time_ns >= from_time_ns,
+                "Invariant: time must be non-decreasing, `to_time_ns` {to_time_ns} < `from_time_ns` {from_time_ns}"
+            );
+            return;
+        }
+        self.advance_clock_reference(clock, to_time_ns, set_time);
+    }
+
+    /// Advance the given clock to the `to_time_ns` and push events to the heap, always calling
+    /// the clock's advance: the pin's [`Self::advance_clock`], kept as the reference it is tested
+    /// against.
+    #[doc(hidden)]
+    pub fn advance_clock_reference(
         &mut self,
         clock: &mut VirtualClock,
         to_time_ns: UnixNanos,

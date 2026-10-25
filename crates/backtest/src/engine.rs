@@ -124,6 +124,9 @@ pub struct BacktestEngine {
     backtest_start: Option<UnixNanos>,
     backtest_end: Option<UnixNanos>,
     funding_error: Option<String>,
+    /// Settle every timestamp as the pin did, without the checks that skip work nothing is due
+    /// for (`set_reference_settlement`): the reference the skipping settlement is tested against.
+    reference_settlement: bool,
 }
 
 impl Debug for BacktestEngine {
@@ -193,7 +196,18 @@ impl BacktestEngine {
             backtest_start: None,
             backtest_end: None,
             funding_error: None,
+            reference_settlement: false,
         })
+    }
+
+    /// Settles every timestamp as the pin did when `reference` is set: every command queue is
+    /// drained, every clock advanced, every queued command visited for a pending one, and the
+    /// funding boundaries collected, whether or not anything is due. Unset (the default), each of
+    /// those is skipped when it would do nothing. Kept as the reference the skipping settlement is
+    /// tested against; the results are the same either way.
+    #[doc(hidden)]
+    pub fn set_reference_settlement(&mut self, reference: bool) {
+        self.reference_settlement = reference;
     }
 
     /// Returns a reference to the underlying kernel.
@@ -997,7 +1011,7 @@ impl BacktestEngine {
 
             // Drain deferred commands, then process exchange queues
             self.drain_command_queues()?;
-            self.settle_venues(ts_init, settlement_scope)?;
+            self.settle_venues_after_drain(ts_init, settlement_scope)?;
 
             let prev_last_ns = self.last_ns;
             // If timestamp changed (or exhausted), flush timers then run modules
@@ -1006,8 +1020,14 @@ impl BacktestEngine {
                 .peek()
                 .is_none_or(|next| next.ts_init() > prev_last_ns)
             {
-                self.flush_accumulator_events(&clocks, prev_last_ns)?;
-                self.finalize_timestamp(&clocks, prev_last_ns, settlement_scope)?;
+                let timers_ran = self.flush_accumulator_events(&clocks, prev_last_ns)?;
+                // The venues were settled for this instant and scope just above: with no timer
+                // run since, nothing has been queued or changed that a settlement could act on
+                let settled = !self.reference_settlement
+                    && !timers_ran
+                    && prev_last_ns == ts_init
+                    && !self.kernel.is_shutdown_requested();
+                self.finalize_settled_timestamp(&clocks, prev_last_ns, settlement_scope, settled)?;
             }
 
             self.iteration += 1;
@@ -1746,7 +1766,13 @@ impl BacktestEngine {
         clocks: &[Rc<RefCell<dyn Clock>>],
     ) -> anyhow::Result<()> {
         for clock in clocks {
-            Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
+            Self::advance_clock_on_accumulator(
+                &mut self.accumulator,
+                clock,
+                ts_now,
+                false,
+                self.reference_settlement,
+            );
         }
 
         // Process events with ts_event < ts_now
@@ -1776,7 +1802,13 @@ impl BacktestEngine {
             }
 
             for clock in clocks {
-                Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
+                Self::advance_clock_on_accumulator(
+                    &mut self.accumulator,
+                    clock,
+                    ts_now,
+                    false,
+                    self.reference_settlement,
+                );
             }
         }
 
@@ -1793,21 +1825,30 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// Runs the timers due by `ts_now`, finalizing each instant one fires at. Returns whether any
+    /// timer ran.
     fn flush_accumulator_events(
         &mut self,
         clocks: &[Rc<RefCell<dyn Clock>>],
         ts_now: UnixNanos,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // Bail after shutdown so handler-scheduled alerts do not fire post-stop
         if self.kernel.is_shutdown_requested() {
             self.accumulator.clear();
-            return Ok(());
+            return Ok(false);
         }
 
         let last_ns = self.last_ns;
+        let mut timers_ran = false;
 
         for clock in clocks {
-            Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
+            Self::advance_clock_on_accumulator(
+                &mut self.accumulator,
+                clock,
+                ts_now,
+                false,
+                self.reference_settlement,
+            );
         }
 
         while let Some(ts_event) = self
@@ -1815,6 +1856,7 @@ impl BacktestEngine {
             .peek_next_time()
             .filter(|ts_event| *ts_event <= ts_now)
         {
+            timers_ran = true;
             let settlement_scope = self.run_timer_handlers_at(clocks, ts_event, ts_now)?;
 
             if self.kernel.is_shutdown_requested() {
@@ -1830,7 +1872,13 @@ impl BacktestEngine {
             }
 
             for clock in clocks {
-                Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
+                Self::advance_clock_on_accumulator(
+                    &mut self.accumulator,
+                    clock,
+                    ts_now,
+                    false,
+                    self.reference_settlement,
+                );
             }
         }
 
@@ -1838,7 +1886,7 @@ impl BacktestEngine {
             self.last_ns = last_ns;
         }
 
-        Ok(())
+        Ok(timers_ran)
     }
 
     fn process_next_timer(&mut self, clocks: &[Rc<RefCell<dyn Clock>>]) -> anyhow::Result<bool> {
@@ -1901,7 +1949,13 @@ impl BacktestEngine {
             }
 
             for clock in clocks {
-                Self::advance_clock_on_accumulator(&mut self.accumulator, clock, advance_to, false);
+                Self::advance_clock_on_accumulator(
+                    &mut self.accumulator,
+                    clock,
+                    advance_to,
+                    false,
+                    self.reference_settlement,
+                );
             }
         }
 
@@ -1912,10 +1966,30 @@ impl BacktestEngine {
         &mut self,
         clocks: &[Rc<RefCell<dyn Clock>>],
         ts_now: UnixNanos,
-        mut settlement_scope: SettlementScope,
+        settlement_scope: SettlementScope,
     ) -> anyhow::Result<()> {
+        self.finalize_settled_timestamp(clocks, ts_now, settlement_scope, false)
+    }
+
+    /// [`Self::finalize_timestamp`], told whether the venues are already settled for `ts_now` and
+    /// `settlement_scope`: a [`Self::settle_venues`] for them has returned and nothing has run
+    /// since (no data delivered, no timer, no venue touched). Its first settlement is then
+    /// skipped when it would do nothing ([`Self::drain_would_be_empty`]): the exchange clocks are
+    /// already at `ts_now`, the queues are as the last drain left them, and the venues answer the
+    /// pending-command question as they did when that settlement ended, with none.
+    fn finalize_settled_timestamp(
+        &mut self,
+        clocks: &[Rc<RefCell<dyn Clock>>],
+        ts_now: UnixNanos,
+        mut settlement_scope: SettlementScope,
+        settled: bool,
+    ) -> anyhow::Result<()> {
+        let mut settled = settled;
         loop {
-            self.settle_venues(ts_now, settlement_scope)?;
+            if !(settled && self.drain_would_be_empty()) {
+                self.settle_venues(ts_now, settlement_scope)?;
+            }
+            settled = false;
 
             if self.kernel.is_shutdown_requested() {
                 self.accumulator.clear();
@@ -1923,7 +1997,13 @@ impl BacktestEngine {
             }
 
             for clock in clocks {
-                Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
+                Self::advance_clock_on_accumulator(
+                    &mut self.accumulator,
+                    clock,
+                    ts_now,
+                    false,
+                    self.reference_settlement,
+                );
             }
 
             if self.accumulator.peek_next_time() == Some(ts_now) {
@@ -1949,6 +2029,20 @@ impl BacktestEngine {
     }
 
     fn settle_funding_rates(&mut self, ts_now: UnixNanos) -> anyhow::Result<bool> {
+        // Each venue's boundaries are keyed boundary first, so none is due by `ts_now` exactly
+        // when every venue's first is later (or it has none): the collection below would be
+        // empty, which returns `false` and touches nothing
+        if !self.reference_settlement
+            && self.venues.values().all(|exchange| {
+                exchange
+                    .borrow()
+                    .next_funding_boundary()
+                    .is_none_or(|boundary| boundary > ts_now)
+            })
+        {
+            return Ok(false);
+        }
+
         let mut due = self
             .venues
             .iter()
@@ -2137,11 +2231,33 @@ impl BacktestEngine {
         ts_now: UnixNanos,
         settlement_scope: SettlementScope,
     ) -> anyhow::Result<()> {
+        self.settle_venues_from(ts_now, settlement_scope, false)
+    }
+
+    /// [`Self::settle_venues`] called right after [`Self::drain_command_queues`] returned: its
+    /// first drain is skipped when it would do nothing ([`Self::drain_would_be_empty`]), since
+    /// only the venue clocks are set in between.
+    fn settle_venues_after_drain(
+        &self,
+        ts_now: UnixNanos,
+        settlement_scope: SettlementScope,
+    ) -> anyhow::Result<()> {
+        self.settle_venues_from(ts_now, settlement_scope, !self.reference_settlement)
+    }
+
+    fn settle_venues_from(
+        &self,
+        ts_now: UnixNanos,
+        settlement_scope: SettlementScope,
+        drained: bool,
+    ) -> anyhow::Result<()> {
         // Advance venue clocks so modules and event generators see the
         // correct timestamp even when no commands are pending
         for exchange in self.venues.values() {
             exchange.borrow().set_clock_time(ts_now);
         }
+
+        let mut skip_drain = drained && self.drain_would_be_empty();
 
         // Drain commands then iterate matching engines to fill newly added
         // orders. Fills may enqueue further commands (e.g. hedge orders
@@ -2151,14 +2267,21 @@ impl BacktestEngine {
         loop {
             // Drain first so commands buffered in the trading queue (e.g. from
             // on_stop handlers) reach the venues before we check for activity.
-            self.drain_command_queues()?;
+            if !skip_drain {
+                self.drain_command_queues()?;
+            }
+            skip_drain = false;
 
             let active_venues: Vec<Venue> = self
                 .venues
                 .iter()
                 .filter(|(_, ex)| {
-                    ex.borrow()
-                        .has_pending_commands_for_scope(ts_now, settlement_scope)
+                    let ex = ex.borrow();
+                    if self.reference_settlement {
+                        ex.has_pending_commands_for_scope_scan(ts_now, settlement_scope)
+                    } else {
+                        ex.has_pending_commands_for_scope(ts_now, settlement_scope)
+                    }
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -2245,9 +2368,28 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// Whether a [`Self::drain_command_queues`] now would do nothing, given that the last one
+    /// returned and nothing has run since.
+    ///
+    /// That drain returned once the trading and data command queues were empty and no callback
+    /// was pending, which nothing since can have changed. What it can have left behind is
+    /// another kind of work its last callbacks produced after it had checked: an order event
+    /// queued on an execution client, a balance error or a callback failure. With none of those,
+    /// a drain dispatches nothing and returns `Ok`.
+    fn drain_would_be_empty(&self) -> bool {
+        actor::callback_failure().is_none()
+            && self.kernel.portfolio.borrow().balance_error().is_none()
+            && self
+                .exec_clients
+                .iter()
+                .all(|client| !client.has_queued_events())
+    }
+
     fn drain_exec_client_events(&self) {
         for client in &self.exec_clients {
-            client.drain_queued_events();
+            if self.reference_settlement || client.has_queued_events() {
+                client.drain_queued_events();
+            }
         }
     }
 
@@ -2260,8 +2402,13 @@ impl BacktestEngine {
         // until all queues settle. Handles cascading re-entrancy
         // (e.g. strategy submits order from on_order_filled).
         loop {
-            drain_trading_cmd_queue();
-            drain_data_cmd_queue();
+            // Draining an empty queue dispatches nothing, so an empty one is passed over
+            if self.reference_settlement || !trading_cmd_queue_is_empty() {
+                drain_trading_cmd_queue();
+            }
+            if self.reference_settlement || !data_cmd_queue_is_empty() {
+                drain_data_cmd_queue();
+            }
             self.drain_exec_client_events();
             self.check_balance_error()?;
 
@@ -2284,13 +2431,18 @@ impl BacktestEngine {
         clock: &Rc<RefCell<dyn Clock>>,
         to_time_ns: UnixNanos,
         set_time: bool,
+        reference: bool,
     ) {
         let mut clock_ref = clock.borrow_mut();
         let test_clock = clock_ref
             .as_any_mut()
             .downcast_mut::<VirtualClock>()
             .expect("BacktestEngine requires VirtualClock");
-        accumulator.advance_clock(test_clock, to_time_ns, set_time);
+        if reference {
+            accumulator.advance_clock_reference(test_clock, to_time_ns, set_time);
+        } else {
+            accumulator.advance_clock(test_clock, to_time_ns, set_time);
+        }
     }
 
     fn set_all_clocks_time(clocks: &[Rc<RefCell<dyn Clock>>], time_ns: UnixNanos) {
@@ -4045,6 +4197,7 @@ mod tests {
                 &mut engine.accumulator,
                 clock,
                 UnixNanos::from(30),
+                false,
                 false,
             );
         }

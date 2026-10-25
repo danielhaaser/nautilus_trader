@@ -125,6 +125,134 @@ impl PartialOrd for InflightCommand {
     }
 }
 
+/// The latency-deferred commands, a min-heap by arrival instant, with an index of when each
+/// instrument's commands arrive.
+///
+/// The index answers "has a command for this scope arrived by this instant" without visiting
+/// the commands: [`Self::has_due_for_scope`] returns what [`Self::has_due_for_scope_scan`] (the
+/// pin's walk over every queued command, kept as the reference) returns. Its per-instrument part,
+/// [`Self::earliest_for`], is also what a replay that holds an instrument's book updates until
+/// something touches the instrument has to ask: when does a command for it next reach the venue.
+///
+/// The heap's pop order is its `Ord`, the arrival instant then the per-instant counter, which is
+/// unique among the queued commands, so the order commands leave the queue does not depend on how
+/// they were pushed.
+#[derive(Debug, Default)]
+struct InflightQueue {
+    heap: BinaryHeap<InflightCommand>,
+    /// Per instrument: how many queued commands arrive at each instant.
+    by_instrument: AHashMap<InstrumentId, BTreeMap<UnixNanos, u32>>,
+    /// Per instant: how many queued commands arrive at the instant they were created (no
+    /// latency). Such a command matches every scope at its arrival (`matches_scope`).
+    zero_latency: BTreeMap<UnixNanos, u32>,
+}
+
+impl InflightQueue {
+    fn push(&mut self, inflight: InflightCommand) {
+        *self
+            .by_instrument
+            .entry(inflight.command.instrument_id())
+            .or_default()
+            .entry(inflight.timestamp)
+            .or_default() += 1;
+        if inflight.command.ts_init() == inflight.timestamp {
+            *self.zero_latency.entry(inflight.timestamp).or_default() += 1;
+        }
+        self.heap.push(inflight);
+    }
+
+    fn pop(&mut self) -> Option<InflightCommand> {
+        let inflight = self.heap.pop()?;
+        let instrument_id = inflight.command.instrument_id();
+        if let Some(arrivals) = self.by_instrument.get_mut(&instrument_id) {
+            decrement(arrivals, inflight.timestamp);
+            if arrivals.is_empty() {
+                self.by_instrument.remove(&instrument_id);
+            }
+        }
+        if inflight.command.ts_init() == inflight.timestamp {
+            decrement(&mut self.zero_latency, inflight.timestamp);
+        }
+        Some(inflight)
+    }
+
+    fn peek(&self) -> Option<&InflightCommand> {
+        self.heap.peek()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &InflightCommand> {
+        self.heap.iter()
+    }
+
+    fn clear(&mut self) {
+        self.heap.clear();
+        self.by_instrument.clear();
+        self.zero_latency.clear();
+    }
+
+    /// The earliest arrival instant of a queued command for `instrument_id`, if one is queued.
+    fn earliest_for(&self, instrument_id: &InstrumentId) -> Option<UnixNanos> {
+        self.by_instrument
+            .get(instrument_id)
+            .and_then(BTreeMap::first_key_value)
+            .map(|(timestamp, _)| *timestamp)
+    }
+
+    /// Whether a queued command has arrived by `ts_now` and matches `scope`.
+    ///
+    /// The earliest arrival rules everything out when it is after `ts_now`, and decides `All`.
+    /// For a data scope a command matches when it addresses the scope's instrument (that
+    /// instrument's earliest arrival is by `ts_now`) or was created at `ts_now`; an arrival is its
+    /// creation plus a latency, never earlier, so a command created at `ts_now` that has arrived
+    /// by `ts_now` arrives exactly then and was created exactly then: a zero-latency arrival at
+    /// `ts_now`.
+    fn has_due_for_scope(&self, ts_now: UnixNanos, scope: SettlementScope) -> bool {
+        if self
+            .heap
+            .peek()
+            .is_none_or(|first| first.timestamp > ts_now)
+        {
+            return false;
+        }
+        match scope {
+            SettlementScope::All => true,
+            SettlementScope::Data(instrument_id) => {
+                self.zero_latency.contains_key(&ts_now)
+                    || instrument_id.is_some_and(|id| {
+                        self.earliest_for(&id)
+                            .is_some_and(|timestamp| timestamp <= ts_now)
+                    })
+            }
+        }
+    }
+
+    /// The pin's question, asked of every queued command: the reference
+    /// [`Self::has_due_for_scope`] is tested against.
+    fn has_due_for_scope_scan(&self, ts_now: UnixNanos, scope: SettlementScope) -> bool {
+        self.heap
+            .iter()
+            .any(|inflight| inflight.timestamp <= ts_now && inflight.matches_scope(ts_now, scope))
+    }
+}
+
+impl Extend<InflightCommand> for InflightQueue {
+    fn extend<T: IntoIterator<Item = InflightCommand>>(&mut self, iter: T) {
+        for inflight in iter {
+            self.push(inflight);
+        }
+    }
+}
+
+/// Takes one off the count at `timestamp`, dropping the entry at zero.
+fn decrement(counts: &mut BTreeMap<UnixNanos, u32>, timestamp: UnixNanos) {
+    if let Some(count) = counts.get_mut(&timestamp) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&timestamp);
+        }
+    }
+}
+
 /// Simulated exchange venue for realistic trading execution during backtesting.
 ///
 /// The `SimulatedExchange` provides a simulation of a trading venue,
@@ -201,7 +329,7 @@ pub struct SimulatedExchange {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     message_queue: VecDeque<TradingCommand>,
-    inflight_queue: BinaryHeap<InflightCommand>,
+    inflight_queue: InflightQueue,
     inflight_orders: InflightOrders,
     inflight_counter: AHashMap<UnixNanos, u32>,
     bar_execution: bool,
@@ -474,7 +602,7 @@ impl SimulatedExchange {
             clock,
             cache,
             message_queue: VecDeque::new(),
-            inflight_queue: BinaryHeap::new(),
+            inflight_queue: InflightQueue::default(),
             inflight_orders: InflightOrders::default(),
             inflight_counter: AHashMap::new(),
             bar_execution: config.bar_execution,
@@ -1203,9 +1331,34 @@ impl SimulatedExchange {
             return true;
         }
 
-        self.inflight_queue
-            .iter()
-            .any(|inflight| inflight.timestamp <= ts_now && inflight.matches_scope(ts_now, scope))
+        self.inflight_queue.has_due_for_scope(ts_now, scope)
+    }
+
+    /// [`Self::has_pending_commands_for_scope`] as the pin asked it, visiting every queued
+    /// command. Kept as the reference the indexed answer is tested against, and run by
+    /// [`crate::engine::BacktestEngine`] only under its reference settlement.
+    #[doc(hidden)]
+    pub(crate) fn has_pending_commands_for_scope_scan(
+        &self,
+        ts_now: UnixNanos,
+        scope: SettlementScope,
+    ) -> bool {
+        if matches!(scope, SettlementScope::All) {
+            return self.has_pending_commands(ts_now);
+        }
+
+        if !self.message_queue.is_empty() || self.outbound.has_due(ts_now) {
+            return true;
+        }
+
+        self.inflight_queue.has_due_for_scope_scan(ts_now, scope)
+    }
+
+    /// The earliest instant a latency-deferred command for `instrument_id` reaches the venue, if
+    /// one is in flight.
+    #[must_use]
+    pub fn next_command_arrival_for(&self, instrument_id: &InstrumentId) -> Option<UnixNanos> {
+        self.inflight_queue.earliest_for(instrument_id)
     }
 
     /// Returns the latest arrival timestamp across all latency-deferred
@@ -2781,6 +2934,104 @@ mod tests {
         );
         assert!(!inflight.matches_scope(UnixNanos::from(1), SettlementScope::Data(None)));
         assert!(inflight.matches_scope(UnixNanos::default(), SettlementScope::Data(None)));
+    }
+
+    fn query_order_for(instrument_id: InstrumentId, ts_init: u64) -> TradingCommand {
+        TradingCommand::QueryOrder(QueryOrder::new(
+            TraderId::test_default(),
+            None,
+            StrategyId::test_default(),
+            instrument_id,
+            ClientOrderId::from("O-001"),
+            None,
+            UUID4::new(),
+            UnixNanos::from(ts_init),
+            None,
+            None,
+        ))
+    }
+
+    /// The index answers every scope as the walk over the queued commands does, through pushes,
+    /// settlements that defer what their scope does not match (as `process_commands` does), and
+    /// an advancing clock; and each instrument's earliest arrival is the walk's minimum.
+    #[rstest]
+    fn test_inflight_queue_index_answers_as_the_scan() {
+        let instruments = [
+            InstrumentId::from("AUD/USD.SIM"),
+            InstrumentId::from("GBP/USD.SIM"),
+            InstrumentId::from("EUR/USD.SIM"),
+        ];
+        let mut scopes = vec![SettlementScope::All, SettlementScope::Data(None)];
+        scopes.extend(instruments.map(|id| SettlementScope::Data(Some(id))));
+
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut draw = |n: usize| {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from((rng >> 33) % n as u64).unwrap()
+        };
+        let mut queue = InflightQueue::default();
+        let mut counters: AHashMap<UnixNanos, u32> = AHashMap::new();
+        let mut now = 100_u64;
+        let (mut due, mut not_due) = ([0_usize; 5], [0_usize; 5]);
+
+        for _ in 0..4_000 {
+            match draw(5) {
+                0 | 1 => {
+                    let instrument_id = instruments[draw(3)];
+                    let ts_init = now - draw(3) as u64;
+                    let latency = [0, 0, 1, 4, 12][draw(5)];
+                    let timestamp = UnixNanos::from(ts_init + latency);
+                    let counter = counters.entry(timestamp).or_default();
+                    *counter += 1;
+                    queue.push(InflightCommand::new(
+                        timestamp,
+                        *counter,
+                        query_order_for(instrument_id, ts_init),
+                    ));
+                }
+                2 => {
+                    let scope = scopes[draw(scopes.len())];
+                    let ts_now = UnixNanos::from(now);
+                    let mut deferred = Vec::new();
+                    while queue.peek().is_some_and(|first| first.timestamp <= ts_now) {
+                        let inflight = queue.pop().unwrap();
+                        if !inflight.matches_scope(ts_now, scope) {
+                            deferred.push(inflight);
+                        }
+                    }
+                    queue.extend(deferred);
+                }
+                _ => now += draw(4) as u64,
+            }
+
+            for ts in [now - 1, now, now + 1, now + 6] {
+                let ts = UnixNanos::from(ts);
+                for (index, scope) in scopes.iter().enumerate() {
+                    let expected = queue.has_due_for_scope_scan(ts, *scope);
+                    assert_eq!(queue.has_due_for_scope(ts, *scope), expected);
+                    if expected {
+                        due[index] += 1;
+                    } else {
+                        not_due[index] += 1;
+                    }
+                }
+            }
+            for instrument_id in &instruments {
+                let expected = queue
+                    .iter()
+                    .filter(|inflight| inflight.command.instrument_id() == *instrument_id)
+                    .map(|inflight| inflight.timestamp)
+                    .min();
+                assert_eq!(queue.earliest_for(instrument_id), expected);
+            }
+        }
+
+        // Every scope was asked both ways
+        assert!(due.iter().chain(&not_due).all(|count| *count > 100));
+        queue.clear();
+        assert!(queue.by_instrument.is_empty() && queue.zero_latency.is_empty());
     }
 
     #[rstest]

@@ -135,6 +135,16 @@ impl VirtualClock {
         events
     }
 
+    /// Returns the instant of the earliest entry in the timer queue, if any.
+    ///
+    /// An entry can be stale (its timer was cancelled or replaced), so this is a lower bound on
+    /// the next event: when it is `None` or later than `to_time_ns`, [`Self::advance_time`] to
+    /// `to_time_ns` returns no event.
+    #[must_use]
+    pub fn next_scheduled_ns(&self) -> Option<UnixNanos> {
+        self.timer_queue.peek().map(|entry| entry.0.ts_event)
+    }
+
     /// Matches time events with their registered callbacks, preserving input order.
     ///
     /// A named callback takes precedence over the default callback for each event.

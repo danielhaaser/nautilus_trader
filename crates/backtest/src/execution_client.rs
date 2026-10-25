@@ -122,6 +122,12 @@ impl BacktestExecutionClient {
         Ok(self.cache.borrow().try_order_owned(&client_order_id)?)
     }
 
+    /// Returns whether any order event is buffered for [`Self::drain_queued_events`].
+    #[must_use]
+    pub fn has_queued_events(&self) -> bool {
+        !self.queued_events.borrow().is_empty()
+    }
+
     /// Drain buffered order events, sending each to the exec engine.
     pub fn drain_queued_events(&self) {
         let events: Vec<OrderEventAny> = self.queued_events.borrow_mut().drain(..).collect();
