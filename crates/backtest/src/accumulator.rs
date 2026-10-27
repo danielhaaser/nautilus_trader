@@ -165,6 +165,41 @@ impl TimeEventAccumulator {
         }
     }
 
+    /// Returns the sequence the next accumulated event gets (its tie-break among events at one
+    /// instant with one name), for saving a backtest at a batch boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accumulator holds events: at a boundary every event due has run.
+    pub fn export_state(&self) -> anyhow::Result<u64> {
+        let Self {
+            heap,
+            next_sequence,
+        } = self;
+        anyhow::ensure!(
+            heap.is_empty(),
+            "the time event accumulator holds {} events: not at a batch boundary",
+            heap.len()
+        );
+        Ok(*next_sequence)
+    }
+
+    /// Sets the sequence the next accumulated event gets, restoring a saved backtest. The
+    /// accumulator must be empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accumulator holds events.
+    pub fn restore_next_sequence(&mut self, next_sequence: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.heap.is_empty(),
+            "the time event accumulator holds {} events",
+            self.heap.len()
+        );
+        self.next_sequence = next_sequence;
+        Ok(())
+    }
+
     /// Check if the heap is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {

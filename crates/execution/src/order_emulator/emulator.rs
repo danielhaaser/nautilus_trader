@@ -87,6 +87,50 @@ impl Debug for OrderEmulator {
 }
 
 impl OrderEmulator {
+    /// Returns an error unless the emulator holds nothing: a saved backtest carries no emulated
+    /// order (an emulated order's matching core, subscriptions and handlers are not saved).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming what the emulator holds.
+    pub fn check_idle(&self) -> anyhow::Result<()> {
+        let Self {
+            clock: _, // Rebuilt by setup
+            cache: _, // Rebuilt by setup
+            manager,
+            matching_cores,
+            subscribed_quotes,
+            subscribed_trades,
+            subscribed_strategies,
+            monitored_positions,
+            quote_tick_handler: _, // Rebuilt by setup
+            trade_tick_handler: _, // Rebuilt by setup
+            quote_handlers,
+            trade_handlers,
+            on_event_handler: _, // Rebuilt by setup
+            pending_messages,
+        } = self;
+        let manager = manager.export_state();
+        anyhow::ensure!(
+            manager.submit_order_commands.is_empty()
+                && manager.oto_target_quantities.is_empty()
+                && matching_cores
+                    .values()
+                    .all(|core| core.iter_orders().next().is_none())
+                && subscribed_quotes.is_empty()
+                && subscribed_trades.is_empty()
+                && subscribed_strategies.is_empty()
+                && monitored_positions.is_empty()
+                && quote_handlers.is_empty()
+                && trade_handlers.is_empty()
+                && pending_messages.borrow().is_empty(),
+            "the order emulator holds emulated orders, which a saved backtest cannot carry"
+        );
+        Ok(())
+    }
+}
+
+impl OrderEmulator {
     pub fn new(clock: Rc<RefCell<dyn Clock>>, cache: Rc<RefCell<Cache>>) -> Self {
         let active_local = true;
         let manager = OrderManager::new(clock.clone(), cache.clone(), active_local);

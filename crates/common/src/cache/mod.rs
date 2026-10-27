@@ -22,6 +22,7 @@ pub mod database;
 pub mod fifo;
 pub mod quote;
 pub mod refs;
+pub mod state;
 
 mod api;
 mod bounded;
@@ -141,6 +142,10 @@ pub struct Cache {
     positions: AHashMap<PositionId, SharedCell<Position>>,
     position_snapshots: AHashMap<PositionId, Vec<PositionSnapshotFrame>>,
     position_snapshot_revisions: AHashMap<PositionId, u64>,
+    /// The instruments added, replaced or purged since [`Self::track_instrument_changes`] was
+    /// called, when it has been: what a saved backtest records of the instruments, as its setup
+    /// rebuilds the rest.
+    instrument_changes: Option<AHashSet<InstrumentId>>,
     #[cfg(feature = "defi")]
     pub(crate) defi: crate::defi::cache::DefiCache,
 }
@@ -251,6 +256,7 @@ impl Cache {
             positions: AHashMap::new(),
             position_snapshots: AHashMap::new(),
             position_snapshot_revisions: AHashMap::new(),
+            instrument_changes: None,
             #[cfg(feature = "defi")]
             defi: crate::defi::cache::DefiCache::default(),
         })
@@ -1958,6 +1964,9 @@ impl Cache {
         }
 
         self.instruments.remove(&instrument_id);
+        if let Some(changes) = &mut self.instrument_changes {
+            changes.insert(instrument_id);
+        }
         self.synthetics.remove(&instrument_id);
         self.books.remove(&instrument_id);
         self.own_books.remove(&instrument_id);
@@ -2593,6 +2602,9 @@ impl Cache {
             database.add_instrument(&instrument)?;
         }
 
+        if let Some(changes) = &mut self.instrument_changes {
+            changes.insert(instrument.id());
+        }
         self.instruments.insert(instrument.id(), instrument);
         Ok(())
     }

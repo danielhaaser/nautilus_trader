@@ -5491,6 +5491,7 @@ dependencies = [
  "parking_lot",
  "pyo3",
  "pyo3-stub-gen",
+ "rmp-serde",
  "rstest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -6817,6 +6818,7 @@ name = "nautilus-risk"
 version = "0.66.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "bon",
  "indexmap 2.14.2",
  "log",

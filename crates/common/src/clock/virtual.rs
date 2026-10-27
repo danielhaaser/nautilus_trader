@@ -33,8 +33,35 @@ use super::{
 };
 use crate::timer::{
     ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler, TimerInterval,
-    TimerSchedule, VirtualTimer, create_valid_interval,
+    TimerSchedule, VirtualTimer, VirtualTimerState, create_valid_interval,
 };
+
+/// One timer of a [`VirtualClockState`]: its state, and whether it fires through a callback
+/// registered under its name (otherwise through the clock's default handler).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClockTimerState {
+    /// The timer's state.
+    pub timer: VirtualTimerState,
+    /// Whether a callback is registered under the timer's name.
+    pub named_callback: bool,
+}
+
+/// A [`VirtualClock`]'s complete state as plain data, for saving a backtest and resuming it.
+///
+/// Callbacks are closures, so they are named rather than saved: an import asks its resolver for
+/// the callback of each name listed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VirtualClockState {
+    /// The clock's time.
+    pub time_ns: UnixNanos,
+    /// The timers, in name order.
+    pub timers: Vec<ClockTimerState>,
+    /// The names, sorted, of callbacks still registered for no timer: a later timer of the same
+    /// name set without a callback fires through it.
+    pub stale_callbacks: Vec<Ustr>,
+    /// Whether a default handler is registered.
+    pub default_handler: bool,
+}
 
 /// A deterministic clock for controlled time advancement.
 ///
@@ -241,6 +268,228 @@ impl VirtualClock {
         );
         self.insert_timer(timer);
 
+        Ok(())
+    }
+}
+
+/// A family of timers a [`VirtualClock`]'s owner arms again itself when it is rebuilt (setup's
+/// alerts): every timer whose name starts with `prefix`, except those named in `armed_since`
+/// (armed after setup, saved like any other). Such a timer does not change until it fires, which
+/// removes it, so a rebuilt clock holds every one the saved clock still held, and those that fired
+/// are exactly those due at or before the saved clock's time.
+#[derive(Clone, Copy, Debug)]
+pub struct RebuiltTimers<'a> {
+    /// The name prefix of the family.
+    pub prefix: &'a str,
+    /// The family's timers armed after setup.
+    pub armed_since: &'a ahash::AHashSet<Ustr>,
+    /// The family's timers cancelled after setup.
+    pub cancelled_since: &'a ahash::AHashSet<Ustr>,
+}
+
+impl RebuiltTimers<'_> {
+    /// The bounds of the names starting with `prefix`: `[prefix, upper)`.
+    fn bounds(&self) -> (Ustr, Ustr) {
+        let mut upper = self.prefix.as_bytes().to_vec();
+        if let Some(last) = upper.last_mut() {
+            *last = last.saturating_add(1);
+        }
+        (
+            Ustr::from(self.prefix),
+            Ustr::from(String::from_utf8_lossy(&upper).as_ref()),
+        )
+    }
+
+    fn rebuilt(&self, name: &Ustr) -> bool {
+        name.as_str().starts_with(self.prefix) && !self.armed_since.contains(name)
+    }
+}
+
+impl VirtualClock {
+    /// Returns the clock's complete state.
+    ///
+    /// The timers of `rebuilt` are not listed (the owner arms them again) and the clock does not
+    /// visit them: the state's size and the export's time do not grow with them. `keep_stale`
+    /// selects which callbacks registered for no timer are listed: a callback whose name is always
+    /// set again with its callback can never be reached, and need not be.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a timer runs on a [`TimerSchedule`], or a live timer is due at or
+    /// before the clock's time (its event has not fired: the clock is not at a boundary).
+    pub fn export_state(
+        &self,
+        rebuilt: Option<RebuiltTimers<'_>>,
+        keep_stale: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<VirtualClockState> {
+        let Self {
+            time,
+            timers,
+            timer_queue: _, // Derived: rebuilt from the timers (stale entries fire nothing)
+            callbacks,
+        } = self;
+        let super::CallbackRegistry {
+            default_callback,
+            callbacks,
+        } = callbacks;
+        let time_ns = time.get_time_ns();
+        let listed: Vec<&VirtualTimer> = match rebuilt {
+            None => timers.values().collect(),
+            Some(rebuilt) => {
+                let (lower, upper) = rebuilt.bounds();
+                let mut listed: Vec<&VirtualTimer> = timers
+                    .range(..lower)
+                    .chain(timers.range(upper..))
+                    .map(|(_, timer)| timer)
+                    .chain(
+                        rebuilt
+                            .armed_since
+                            .iter()
+                            .filter_map(|name| timers.get(name)),
+                    )
+                    .collect();
+                listed.sort_unstable_by_key(|timer| timer.name);
+                listed
+            }
+        };
+        let timer_states = listed
+            .into_iter()
+            .map(|timer| {
+                anyhow::ensure!(
+                    timer.is_expired() || timer.next_time_ns() > time_ns,
+                    "timer {} is due at {} and the clock is at {time_ns}: not at a boundary",
+                    timer.name,
+                    timer.next_time_ns()
+                );
+                Ok(ClockTimerState {
+                    timer: timer.export_state()?,
+                    named_callback: callbacks.contains_key(&timer.name),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut stale_callbacks: Vec<Ustr> = callbacks
+            .keys()
+            .filter(|name| {
+                !rebuilt.is_some_and(|rebuilt| rebuilt.rebuilt(name))
+                    && keep_stale(name.as_str())
+                    && !timers.contains_key(*name)
+            })
+            .copied()
+            .collect();
+        stale_callbacks.sort_unstable();
+        Ok(VirtualClockState {
+            time_ns,
+            timers: timer_states,
+            stale_callbacks,
+            default_handler: default_callback.is_some(),
+        })
+    }
+
+    /// Replaces the clock's time, timers and named callbacks with `state`'s.
+    ///
+    /// The clock must be the one its owner's setup built. Every timer setup armed is dropped,
+    /// except those of `rebuilt` the saved clock still held (not cancelled since, and not due by
+    /// the saved clock's time); `state`'s timers are armed. `resolve` gives the callback of each
+    /// name `state` lists (each timer with a named callback, then each stale callback), told the
+    /// callback registered under the name, if any; the callbacks of the timers kept stay as setup
+    /// registered them. The default handler is not touched: the clock's owner registers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clock's default handler is not as `state` says, a timer is
+    /// invalid, or `resolve` fails.
+    pub fn import_state(
+        &mut self,
+        state: VirtualClockState,
+        rebuilt: Option<RebuiltTimers<'_>>,
+        resolve: &mut dyn FnMut(
+            Ustr,
+            Option<TimeEventCallback>,
+        ) -> anyhow::Result<TimeEventCallback>,
+    ) -> anyhow::Result<()> {
+        let VirtualClockState {
+            time_ns,
+            timers,
+            stale_callbacks,
+            default_handler,
+        } = state;
+        anyhow::ensure!(
+            self.callbacks.default_callback.is_some() == default_handler,
+            "the clock {} a default handler, the saved clock {}",
+            if default_handler { "has no" } else { "has" },
+            if default_handler {
+                "had one"
+            } else {
+                "had none"
+            }
+        );
+        match rebuilt {
+            None => {
+                self.timers.clear();
+                self.timer_queue.clear();
+            }
+            Some(rebuilt) => {
+                // Setup's other timers go; of its rebuilt family, those that fired in the saved run
+                // (due by its time) and those cancelled since go. The queue keeps entries for
+                // timers dropped (stale entries fire nothing).
+                let (lower, upper) = rebuilt.bounds();
+                let others: Vec<Ustr> = self
+                    .timers
+                    .range(..lower)
+                    .chain(self.timers.range(upper..))
+                    .map(|(name, _)| *name)
+                    .collect();
+                for name in others {
+                    self.timers.remove(&name);
+                }
+                while self
+                    .timer_queue
+                    .peek()
+                    .is_some_and(|entry| entry.0.ts_event <= time_ns)
+                {
+                    let Some(entry) = self.timer_queue.pop() else {
+                        break;
+                    };
+                    let fired = self
+                        .timers
+                        .get(&entry.0.name)
+                        .is_some_and(|timer| timer.next_time_ns() == entry.0.ts_event);
+                    if fired {
+                        self.timers.remove(&entry.0.name);
+                    }
+                }
+                for name in rebuilt.cancelled_since {
+                    self.timers.remove(name);
+                }
+            }
+        }
+        for ClockTimerState {
+            timer,
+            named_callback,
+        } in timers
+        {
+            let timer = VirtualTimer::from_state(timer)?;
+            if named_callback {
+                let before = self.callbacks.callbacks.get(&timer.name).cloned();
+                let callback = resolve(timer.name, before)?;
+                self.callbacks.register_callback(timer.name, callback);
+            } else {
+                anyhow::ensure!(
+                    default_handler,
+                    "timer {} has no callback and the clock no default handler",
+                    timer.name
+                );
+                self.callbacks.callbacks.remove(&timer.name);
+            }
+            self.timer_queue.push(Self::scheduled_event(&timer));
+            self.timers.insert(timer.name, timer);
+        }
+        for name in stale_callbacks {
+            let before = self.callbacks.callbacks.get(&name).cloned();
+            let callback = resolve(name, before)?;
+            self.callbacks.register_callback(name, callback);
+        }
+        self.time.set_time(time_ns);
         Ok(())
     }
 }

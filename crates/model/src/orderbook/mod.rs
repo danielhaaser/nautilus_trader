@@ -23,6 +23,7 @@ pub mod error;
 pub mod ladder;
 pub mod level;
 pub mod own;
+pub mod state;
 
 #[cfg(test)]
 mod tests;
@@ -34,4 +35,5 @@ pub use crate::orderbook::{
     ladder::BookPrice,
     level::BookLevel,
     own::OwnBookOrder,
+    state::{BookSideState, OrderBookState},
 };

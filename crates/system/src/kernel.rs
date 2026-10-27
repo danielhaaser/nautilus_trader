@@ -1167,6 +1167,31 @@ impl NautilusKernel {
         Ok(())
     }
 
+    /// Starts the kernel and its trader for a backtest resumed from a saved state: the engines
+    /// start as [`Self::start`] starts them, and the trader and its components move to running
+    /// without their `on_start` (they started in the run that saved the state).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an event store is configured, state loading is configured, or the
+    /// trader cannot start.
+    pub fn start_restored(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.event_store.is_none(),
+            "a backtest with an event store cannot be resumed from a saved state"
+        );
+        anyhow::ensure!(
+            !self.config.load_state(),
+            "a backtest that loads actor and strategy state cannot be resumed from a saved state"
+        );
+        self.start();
+        self.state_save_armed = self.config.save_state();
+        self.order_emulator.start();
+        Trader::start_restored(&self.trader)?;
+        log::info!("Trader started from a saved state");
+        Ok(())
+    }
+
     /// Starts all engine components.
     fn start_engines(&self) {
         self.data_engine.borrow_mut().start();

@@ -28,6 +28,15 @@ pub struct OrderEmulatorAdapter {
 }
 
 impl OrderEmulatorAdapter {
+    /// Returns an error unless the emulator holds nothing ([`OrderEmulator::check_idle`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming what the emulator holds.
+    pub fn check_idle(&self) -> anyhow::Result<()> {
+        self.emulator.borrow().check_idle()
+    }
+
     /// Creates a new [`OrderEmulatorAdapter`] instance.
     pub fn new(clock: Rc<RefCell<dyn Clock>>, cache: Rc<RefCell<Cache>>) -> Self {
         let emulator = Rc::new(RefCell::new(OrderEmulator::new(clock, cache)));

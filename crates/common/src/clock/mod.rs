@@ -37,7 +37,7 @@ use nautilus_core::{
     datetime::try_datetime_to_unix_nanos,
 };
 use ustr::Ustr;
-pub use virtual_clock::VirtualClock; // Re-export
+pub use virtual_clock::{ClockTimerState, RebuiltTimers, VirtualClock, VirtualClockState}; // Re-export
 
 use crate::timer::{
     TimeEvent, TimeEventCallback, TimeEventHandler, Timer, TimerInterval, TimerSchedule,

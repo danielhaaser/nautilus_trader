@@ -79,6 +79,8 @@ use crate::{
     },
 };
 
+pub mod state;
+
 /// Represents commands with simulated network latency in a min-heap priority queue.
 /// The commands are ordered by timestamp for FIFO processing, with the
 /// earliest timestamp having the highest priority in the queue.
@@ -354,6 +356,15 @@ pub struct SimulatedExchange {
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
     liquidation_cancel_open_orders: bool,
+    /// What the venue's setup registered, recorded when the replay starts
+    /// ([`Self::mark_setup_complete`]): a saved state names what changed since.
+    setup: Option<state::SetupMark>,
+    /// The latest instant [`Self::process_instrument_expirations`] processed: every expiration
+    /// at or before it has left `expirations_pending`.
+    expirations_processed_ns: Option<UnixNanos>,
+    /// The expirations added to `expirations_pending` once the replay started (setup's are
+    /// rebuilt by a resume's setup).
+    expirations_added: Vec<(UnixNanos, InstrumentId)>,
 }
 
 /// A simulated exchange's matching engines, in registration order.
@@ -380,6 +391,32 @@ pub struct MatchingEngines {
     /// Sleeping engines' wake-up instants, `(expiration, slot index)`. An entry can be stale (the
     /// engine woke meanwhile); a stale one only wakes an engine whose iterate is then a no-op.
     alarms: BTreeSet<(UnixNanos, usize)>,
+    /// The slots whose engine may differ from the one setup built, once
+    /// [`Self::track_changes`] started recording: a saved state visits only these.
+    changed: Option<ChangedSlots>,
+}
+
+/// The slots marked changed since setup, each once.
+#[derive(Debug, Default)]
+struct ChangedSlots {
+    marked: Vec<bool>,
+    slots: Vec<usize>,
+}
+
+impl ChangedSlots {
+    fn mark(&mut self, index: usize) {
+        if self.marked.len() <= index {
+            self.marked.resize(index + 1, false);
+        }
+        if !self.marked[index] {
+            self.marked[index] = true;
+            self.slots.push(index);
+        }
+    }
+
+    fn is_marked(&self, index: usize) -> bool {
+        self.marked.get(index).copied().unwrap_or(false)
+    }
 }
 
 impl MatchingEngines {
@@ -394,6 +431,9 @@ impl MatchingEngines {
         let (index, _, slot) = self.slots.get_full_mut(instrument_id)?;
         let engine = slot.as_deref_mut()?;
         wake(&mut self.awake, &mut self.awake_slots, index);
+        if let Some(changed) = &mut self.changed {
+            changed.mark(index);
+        }
         Some(engine)
     }
 
@@ -436,6 +476,9 @@ impl MatchingEngines {
     fn values_mut(&mut self) -> impl Iterator<Item = &mut OrderMatchingEngine> {
         for index in 0..self.slots.len() {
             wake(&mut self.awake, &mut self.awake_slots, index);
+            if let Some(changed) = &mut self.changed {
+                changed.mark(index);
+            }
         }
         self.slots.values_mut().filter_map(Option::as_deref_mut)
     }
@@ -448,6 +491,9 @@ impl MatchingEngines {
             self.live += 1;
         }
         wake(&mut self.awake, &mut self.awake_slots, index);
+        if let Some(changed) = &mut self.changed {
+            changed.mark(index);
+        }
     }
 
     /// Iterates, in registration order, every engine whose iterate at `ts_now` could do anything:
@@ -470,6 +516,13 @@ impl MatchingEngines {
             let work = match self.slots.get_index_mut(index) {
                 Some((_, Some(engine))) => {
                     engine.iterate(ts_now, AggressorSide::NoAggressor);
+                    // An iterate can change an engine nothing else touched (its expiration)
+                    if let Some(changed) = &mut self.changed
+                        && !changed.is_marked(index)
+                        && !engine.is_pristine()
+                    {
+                        changed.mark(index);
+                    }
                     engine.iterate_work(ts_now)
                 }
                 // Removed since it woke; a rebuilt engine wakes on insertion.
@@ -627,6 +680,9 @@ impl SimulatedExchange {
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
             liquidation_cancel_open_orders: config.liquidation_cancel_open_orders,
+            setup: None,
+            expirations_processed_ns: None,
+            expirations_added: Vec::new(),
         };
         exchange.refresh_event_handlers();
         Ok(exchange)
@@ -910,6 +966,9 @@ impl SimulatedExchange {
                 .entry(expiration_ns)
                 .or_default()
                 .push(instrument_id);
+            if self.setup.is_some() {
+                self.expirations_added.push((expiration_ns, instrument_id));
+            }
         }
 
         log::info!("Added instrument {instrument_id} and created matching engine");
@@ -1403,6 +1462,7 @@ impl SimulatedExchange {
     ///
     /// Panics if a due engine is missing from the engine map.
     pub fn process_instrument_expirations(&mut self, ts_now: UnixNanos) {
+        self.expirations_processed_ns = self.expirations_processed_ns.max(Some(ts_now));
         let reached = match ts_now.as_u64().checked_add(1) {
             Some(next) => {
                 let later = self.expirations_pending.split_off(&UnixNanos::from(next));
@@ -2377,6 +2437,8 @@ impl SimulatedExchange {
             matching_engine.reset();
         }
         self.rebuild_expiration_index();
+        self.expirations_processed_ns = None;
+        self.expirations_added.clear();
 
         self.pending_funding_rates.clear();
         self.funding_settlements.clear();

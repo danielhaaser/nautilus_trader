@@ -57,6 +57,22 @@ impl InflightOrders {
     }
 }
 
+impl InflightOrders {
+    /// Returns the orders awaiting venue receipt, sorted, for saving a backtest and resuming it.
+    #[must_use]
+    pub fn export_state(&self) -> Vec<ClientOrderId> {
+        let Self { orders } = self;
+        let mut orders: Vec<ClientOrderId> = orders.borrow().iter().copied().collect();
+        orders.sort_unstable();
+        orders
+    }
+
+    /// Replaces the orders awaiting venue receipt with `orders`.
+    pub fn import_state(&self, orders: Vec<ClientOrderId>) {
+        *self.orders.borrow_mut() = orders.into_iter().collect();
+    }
+}
+
 fn submit_ids(command: &TradingCommand) -> &[ClientOrderId] {
     match command {
         TradingCommand::SubmitOrder(command) => std::slice::from_ref(&command.client_order_id),

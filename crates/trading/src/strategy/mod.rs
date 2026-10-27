@@ -19,7 +19,7 @@ pub mod binding;
 pub mod config;
 pub mod core;
 
-pub use core::{StrategyCore, StrategyNative};
+pub use core::{StrategyCore, StrategyCoreState, StrategyNative};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ahash::AHashSet;

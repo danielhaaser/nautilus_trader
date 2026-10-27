@@ -27,15 +27,16 @@ use indexmap::IndexMap;
 use nautilus_common::python::wrappers::release_python_wrapper;
 use nautilus_common::{
     actor::{
-        DataActor, DataActorNative,
+        DataActor, DataActorNative, DataActorState,
         registry::{deregister_actor, try_get_actor_unchecked},
+        resubscribe,
     },
     cache::Cache,
     clock::Clock,
     component::{
         Component, component_state, deregister_component, dispose_component,
         register_component_actor, release_component_subscriptions, reset_component,
-        start_component, stop_component,
+        start_component, start_component_restored, stop_component,
     },
     enums::{ComponentState, ComponentTrigger, Environment},
     logging::RECV,
@@ -59,7 +60,7 @@ use nautilus_model::{
 use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmNative,
-    strategy::{Strategy, StrategyNative, route_time_event},
+    strategy::{Strategy, StrategyCoreState, StrategyNative, route_time_event},
 };
 use ustr::Ustr;
 
@@ -81,10 +82,37 @@ type PersistedComponentState = IndexMap<String, Vec<u8>>;
 type ComponentStateLoadFn = fn(Ustr, PersistedComponentState) -> anyhow::Result<()>;
 type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
 
+type ComponentResumeExportFn = fn(Ustr) -> anyhow::Result<ComponentResumeState>;
+type ComponentResumeImportFn = fn(Ustr, ComponentResumeState) -> anyhow::Result<()>;
+
 #[derive(Clone, Copy)]
 struct ComponentStateCallbacks {
     load: ComponentStateLoadFn,
     save: ComponentStateSaveFn,
+    /// Exports the component's replay state for a saved backtest.
+    export: ComponentResumeExportFn,
+    /// Restores the component's replay state into a resumed backtest.
+    import: ComponentResumeImportFn,
+}
+
+/// One actor's or strategy's replay state, for saving a backtest and resuming it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ComponentResumeState {
+    /// The actor core's state: its data subscriptions and plain records.
+    pub actor: DataActorState,
+    /// A strategy's core state beyond its actor's; `None` for an actor.
+    pub strategy: Option<StrategyCoreState>,
+}
+
+/// The trader's components' replay states, each list in registration order.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TraderResumeState {
+    /// When the trader started.
+    pub ts_started: Option<UnixNanos>,
+    /// The actors' states.
+    pub actors: Vec<(ActorId, ComponentResumeState)>,
+    /// The strategies' states.
+    pub strategies: Vec<(StrategyId, ComponentResumeState)>,
 }
 
 /// Central orchestrator for managing trading components.
@@ -255,6 +283,15 @@ impl Trader {
         self.clocks.values().cloned().collect()
     }
 
+    /// Returns each component's clock with the component's ID, in registration order.
+    #[must_use]
+    pub fn component_clocks(&self) -> Vec<(ComponentId, Rc<RefCell<dyn Clock>>)> {
+        self.clocks
+            .iter()
+            .map(|(component_id, clock)| (*component_id, Rc::clone(clock)))
+            .collect()
+    }
+
     /// Returns the total number of registered components.
     #[must_use]
     pub const fn component_count(&self) -> usize {
@@ -361,6 +398,8 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                export: Self::export_actor_state::<T>,
+                import: Self::import_actor_state::<T>,
             },
         );
 
@@ -394,6 +433,8 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                export: Self::export_actor_state::<T>,
+                import: Self::import_actor_state::<T>,
             },
         );
 
@@ -511,6 +552,8 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                export: Self::export_strategy_state::<T>,
+                import: Self::import_strategy_state::<T>,
             },
         );
         self.strategy_handler_ids
@@ -698,6 +741,8 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                export: Self::export_strategy_state::<T>,
+                import: Self::import_strategy_state::<T>,
             },
         );
         self.strategy_handler_ids
@@ -1724,6 +1769,196 @@ impl Trader {
             anyhow::anyhow!("Component {component_id} not found in actor registry")
         })?;
         component.on_save()
+    }
+
+    fn export_actor_state<T>(component_id: Ustr) -> anyhow::Result<ComponentResumeState>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let component = try_get_actor_unchecked::<T>(&component_id).ok_or_else(|| {
+            anyhow::anyhow!("Component {component_id} not found in actor registry")
+        })?;
+        Ok(ComponentResumeState {
+            actor: component.core().export_state()?,
+            strategy: None,
+        })
+    }
+
+    fn import_actor_state<T>(component_id: Ustr, state: ComponentResumeState) -> anyhow::Result<()>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let ComponentResumeState { actor, strategy } = state;
+        anyhow::ensure!(
+            strategy.is_none(),
+            "actor {component_id} is restored from a strategy's state"
+        );
+        let mut component = try_get_actor_unchecked::<T>(&component_id).ok_or_else(|| {
+            anyhow::anyhow!("Component {component_id} not found in actor registry")
+        })?;
+        resubscribe(&mut *component, actor)
+    }
+
+    fn export_strategy_state<T>(component_id: Ustr) -> anyhow::Result<ComponentResumeState>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        let component = try_get_actor_unchecked::<T>(&component_id).ok_or_else(|| {
+            anyhow::anyhow!("Component {component_id} not found in actor registry")
+        })?;
+        Ok(ComponentResumeState {
+            actor: component.core().export_state()?,
+            strategy: Some(StrategyNative::strategy_core(&*component).export_state()),
+        })
+    }
+
+    fn import_strategy_state<T>(
+        component_id: Ustr,
+        state: ComponentResumeState,
+    ) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        let ComponentResumeState { actor, strategy } = state;
+        let strategy = strategy.ok_or_else(|| {
+            anyhow::anyhow!("strategy {component_id} is restored from an actor's state")
+        })?;
+        let mut component = try_get_actor_unchecked::<T>(&component_id).ok_or_else(|| {
+            anyhow::anyhow!("Component {component_id} not found in actor registry")
+        })?;
+        resubscribe(&mut *component, actor)?;
+        StrategyNative::strategy_core_mut(&mut *component).import_state(strategy)
+    }
+
+    /// Returns the replay state of every actor and strategy, in registration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an execution algorithm is registered, or a component's state cannot be
+    /// saved.
+    pub fn export_resume_state(&self) -> anyhow::Result<TraderResumeState> {
+        anyhow::ensure!(
+            self.exec_algorithm_ids.is_empty(),
+            "execution algorithms are registered, which a saved backtest cannot carry"
+        );
+        anyhow::ensure!(
+            self.state == ComponentState::Running,
+            "the trader is {:?}: only a running trader is saved",
+            self.state
+        );
+        for id in self
+            .actor_ids
+            .iter()
+            .map(ActorId::inner)
+            .chain(self.strategy_ids.iter().map(StrategyId::inner))
+        {
+            let state = component_state(&id)?;
+            anyhow::ensure!(
+                state == ComponentState::Running,
+                "component {id} is {state:?}: a resumed backtest starts every component running"
+            );
+        }
+        let actors =
+            self.actor_ids
+                .iter()
+                .map(|actor_id| {
+                    let callbacks = self.actor_state_callbacks.get(actor_id).ok_or_else(|| {
+                        anyhow::anyhow!("actor {actor_id} has no state callbacks")
+                    })?;
+                    Ok((*actor_id, (callbacks.export)(actor_id.inner())?))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        let strategies = self
+            .strategy_ids
+            .iter()
+            .map(|strategy_id| {
+                let callbacks =
+                    self.strategy_state_callbacks
+                        .get(strategy_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("strategy {strategy_id} has no state callbacks")
+                        })?;
+                Ok((*strategy_id, (callbacks.export)(strategy_id.inner())?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(TraderResumeState {
+            ts_started: self.ts_started,
+            actors,
+            strategies,
+        })
+    }
+
+    /// Restores every actor's and strategy's replay state: issues its data subscriptions again
+    /// and restores its records. The trader must hold the same actors and strategies, in the same
+    /// order, as the trader that saved `state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the components differ from the saved ones, or a component's state
+    /// cannot be restored.
+    pub fn import_resume_state(&mut self, state: TraderResumeState) -> anyhow::Result<()> {
+        let TraderResumeState {
+            ts_started,
+            actors,
+            strategies,
+        } = state;
+        self.ts_started = ts_started;
+        let saved_actors: Vec<ActorId> = actors.iter().map(|(id, _)| *id).collect();
+        anyhow::ensure!(
+            saved_actors == self.actor_ids,
+            "the saved actors {saved_actors:?} are not the registered {:?}",
+            self.actor_ids
+        );
+        let saved_strategies: Vec<StrategyId> = strategies.iter().map(|(id, _)| *id).collect();
+        anyhow::ensure!(
+            saved_strategies == self.strategy_ids,
+            "the saved strategies {saved_strategies:?} are not the registered {:?}",
+            self.strategy_ids
+        );
+        anyhow::ensure!(
+            self.exec_algorithm_ids.is_empty(),
+            "execution algorithms are registered, which a resumed backtest cannot restore"
+        );
+        for (actor_id, state) in actors {
+            let callbacks = self.actor_state_callbacks[&actor_id];
+            (callbacks.import)(actor_id.inner(), state)?;
+        }
+        for (strategy_id, state) in strategies {
+            let callbacks = self.strategy_state_callbacks[&strategy_id];
+            (callbacks.import)(strategy_id.inner(), state)?;
+        }
+        Ok(())
+    }
+
+    /// Starts the trader and every actor and strategy without calling their `on_start`: the
+    /// start of a backtest resumed from a saved state, whose components started in the run that
+    /// saved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the trader or a component cannot start from its current state.
+    pub fn start_restored(trader: &Rc<RefCell<Self>>) -> anyhow::Result<()> {
+        trader
+            .borrow_mut()
+            .transition_state(ComponentTrigger::Start)?;
+        let (actor_ids, strategy_ids) = {
+            let trader_ref = trader.borrow();
+            (
+                trader_ref.actor_ids.clone(),
+                trader_ref.strategy_ids.clone(),
+            )
+        };
+        for actor_id in actor_ids {
+            start_component_restored(&actor_id.inner())?;
+        }
+        for strategy_id in strategy_ids {
+            start_component_restored(&strategy_id.inner())?;
+        }
+        let mut trader_ref = trader.borrow_mut();
+        let clock = trader_ref.clock_factory.clock();
+        trader_ref.ts_started = Some(clock.borrow().timestamp_ns());
+        trader_ref.transition_state(ComponentTrigger::StartCompleted)?;
+        Ok(())
     }
 
     /// Initializes the trader, transitioning from `PreInitialized` to `Ready` state.

@@ -51,6 +51,8 @@ use rust_decimal::Decimal;
 
 use crate::{config::PortfolioConfig, manager::AccountsManager};
 
+pub mod state;
+
 // Sized for post-run backtest analysis (e.g. ~11 days at 1s cadence, or years
 // at per-minute cadence), long-lived live deployments should consume snapshots
 // via the message bus instead of relying on this buffer.

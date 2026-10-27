@@ -96,6 +96,29 @@ impl<T> BoundedVecDeque<T> {
         }
     }
 
+    /// Returns the maximum number of elements.
+    #[must_use]
+    pub(super) const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Builds a deque of `capacity` holding `items`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `capacity` is outside `[1, 1_000_000]` or `items` exceeds it.
+    pub(super) fn from_items(items: Vec<T>, capacity: usize) -> anyhow::Result<Self> {
+        check_cache_data_capacity(capacity, stringify!(capacity))?;
+        anyhow::ensure!(
+            items.len() <= capacity,
+            "{} items exceed the capacity {capacity}",
+            items.len()
+        );
+        let mut inner = VecDeque::with_capacity(capacity);
+        inner.extend(items);
+        Ok(Self { inner, capacity })
+    }
+
     /// Returns the number of elements.
     #[must_use]
     pub(super) fn len(&self) -> usize {

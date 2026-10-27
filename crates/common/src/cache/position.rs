@@ -80,6 +80,17 @@ impl PositionSnapshotFrame {
         }
     }
 
+    /// Returns the frame's position and its bytes, if they were encoded.
+    pub(super) fn parts(&self) -> (&Position, Option<&Bytes>) {
+        let Self { position, encoded } = self;
+        (position, encoded.get())
+    }
+
+    /// Builds a frame from [`Self::parts`].
+    pub(super) fn from_parts(position: Position, encoded: Option<Bytes>) -> Self {
+        Self::new(position, encoded)
+    }
+
     fn encoded(&self) -> anyhow::Result<Bytes> {
         if let Some(encoded) = self.encoded.get() {
             return Ok(encoded.clone());

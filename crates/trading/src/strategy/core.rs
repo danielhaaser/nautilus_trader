@@ -24,13 +24,13 @@ use nautilus_common::{
     actor::{DataActorConfig, DataActorCore, DataActorNative},
     cache::Cache,
     clock::Clock,
-    factories::OrderFactory,
+    factories::{OrderFactory, OrderFactoryState},
 };
 use nautilus_core::{
     UUID4,
     correctness::{CorrectnessResult, CorrectnessResultExt, FAILED},
 };
-use nautilus_execution::order_manager::manager::OrderManager;
+use nautilus_execution::order_manager::manager::{OrderManager, OrderManagerState};
 use nautilus_model::identifiers::{
     ActorId, ClientOrderId, StrategyId, TraderId, UNASSIGNED_ORDER_ID_TAG, check_order_id_tag,
     normalize_order_id_tag,
@@ -68,6 +68,113 @@ pub struct StrategyCore {
     pub(crate) market_exit_attempts: u64,
     pub(crate) market_exit_timer_name: Ustr,
     pub(crate) market_exit_tag: Ustr,
+}
+
+/// A [`StrategyCore`]'s replay state beyond its actor's ([`DataActorCore::export_state`]), for
+/// saving a backtest and resuming it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StrategyCoreState {
+    /// The order manager's state, once registered.
+    pub order_manager: Option<OrderManagerState>,
+    /// The order factory's counts, once registered.
+    pub order_factory: Option<OrderFactoryState>,
+    /// The GTD expiry timer of each order, sorted by order.
+    pub gtd_timers: Vec<(ClientOrderId, Ustr)>,
+    /// The last framework-managed time event handled.
+    pub managed_time_event_last_id: Option<UUID4>,
+    /// Whether a market exit is in progress.
+    pub is_exiting: bool,
+    /// Whether a stop waits for the market exit.
+    pub pending_stop: bool,
+    /// The market exit attempts made.
+    pub market_exit_attempts: u64,
+    /// The market exit check timer's name.
+    pub market_exit_timer_name: Ustr,
+    /// The market exit orders' tag.
+    pub market_exit_tag: Ustr,
+}
+
+impl StrategyCore {
+    /// Returns the strategy's replay state beyond its actor's.
+    #[must_use]
+    pub fn export_state(&self) -> StrategyCoreState {
+        let Self {
+            actor: _,        // Saved by the actor's own export
+            config: _,       // Rebuilt by setup
+            strategy_id: _,  // Rebuilt by setup
+            order_id_tag: _, // Rebuilt by setup
+            order_manager,
+            order_factory,
+            portfolio: _, // Rebuilt by setup: registration
+            gtd_timers,
+            managed_time_event_last_id,
+            is_exiting,
+            pending_stop,
+            market_exit_attempts,
+            market_exit_timer_name,
+            market_exit_tag,
+        } = self;
+        let mut gtd_timers: Vec<(ClientOrderId, Ustr)> = gtd_timers
+            .iter()
+            .map(|(client_order_id, name)| (*client_order_id, *name))
+            .collect();
+        gtd_timers.sort_unstable_by_key(|(client_order_id, _)| *client_order_id);
+        StrategyCoreState {
+            order_manager: order_manager.as_ref().map(OrderManager::export_state),
+            order_factory: order_factory
+                .as_ref()
+                .map(|factory| factory.borrow().export_state()),
+            gtd_timers,
+            managed_time_event_last_id: *managed_time_event_last_id,
+            is_exiting: *is_exiting,
+            pending_stop: *pending_stop,
+            market_exit_attempts: *market_exit_attempts,
+            market_exit_timer_name: *market_exit_timer_name,
+            market_exit_tag: *market_exit_tag,
+        }
+    }
+
+    /// Overwrites the strategy's replay state beyond its actor's with `state`. The strategy must
+    /// be registered, as the saved one was.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `state` has an order manager or factory and the strategy is not
+    /// registered.
+    pub fn import_state(&mut self, state: StrategyCoreState) -> anyhow::Result<()> {
+        let StrategyCoreState {
+            order_manager,
+            order_factory,
+            gtd_timers,
+            managed_time_event_last_id,
+            is_exiting,
+            pending_stop,
+            market_exit_attempts,
+            market_exit_timer_name,
+            market_exit_tag,
+        } = state;
+        if let Some(order_manager) = order_manager {
+            self.order_manager
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("the strategy has no order manager to restore"))?
+                .import_state(order_manager);
+        }
+        if let Some(order_factory) = order_factory {
+            self.order_factory
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("the strategy has no order factory to restore"))?
+                .borrow_mut()
+                .import_state(order_factory);
+        }
+        self.gtd_timers = gtd_timers.into_iter().collect();
+        self.managed_time_event_last_id = managed_time_event_last_id;
+        self.is_exiting = is_exiting;
+        self.pending_stop = pending_stop;
+        self.market_exit_attempts = market_exit_attempts;
+        self.market_exit_timer_name = market_exit_timer_name;
+        self.market_exit_tag = market_exit_tag;
+        Ok(())
+    }
 }
 
 impl Debug for StrategyCore {

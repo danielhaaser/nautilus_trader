@@ -44,6 +44,52 @@ pub struct IdsGenerator {
     execution_count: usize,
 }
 
+/// An [`IdsGenerator`]'s counts, for saving a backtest and resuming it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IdsGeneratorState {
+    /// Positions generated.
+    pub position_count: usize,
+    /// Venue orders generated.
+    pub order_count: usize,
+    /// Executions (trade IDs) generated.
+    pub execution_count: usize,
+}
+
+impl IdsGenerator {
+    /// Returns the generator's counts.
+    #[must_use]
+    pub fn export_state(&self) -> IdsGeneratorState {
+        let Self {
+            venue: _,            // Rebuilt by setup: the engine's venue
+            raw_id: _,           // Rebuilt by setup: the engine's raw ID
+            oms_type: _,         // Rebuilt by setup: the venue's config
+            use_random_ids: _,   // Rebuilt by setup: the venue's config
+            use_position_ids: _, // Rebuilt by setup: the venue's config
+            cache: _,            // Rebuilt by setup: the kernel's cache
+            position_count,
+            order_count,
+            execution_count,
+        } = self;
+        IdsGeneratorState {
+            position_count: *position_count,
+            order_count: *order_count,
+            execution_count: *execution_count,
+        }
+    }
+
+    /// Sets the generator's counts to `state`'s.
+    pub fn import_state(&mut self, state: IdsGeneratorState) {
+        let IdsGeneratorState {
+            position_count,
+            order_count,
+            execution_count,
+        } = state;
+        self.position_count = position_count;
+        self.order_count = order_count;
+        self.execution_count = execution_count;
+    }
+}
+
 impl Debug for IdsGenerator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(IdsGenerator))

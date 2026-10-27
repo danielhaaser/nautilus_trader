@@ -187,6 +187,76 @@ impl BookLadder {
         Ok(())
     }
 
+    /// Returns the ladder's levels in ladder order, each its price and its orders in FIFO order,
+    /// and the unfinished L1 batch state's code, for [`crate::orderbook::OrderBookState`].
+    pub(crate) fn export_levels(&self) -> (Vec<(Price, Vec<BookOrder>)>, u8) {
+        let Self {
+            side: _,      // Rebuilt by the book: its side
+            book_type: _, // Rebuilt by the book: its book type
+            levels,
+            cache: _, // Derived: rebuilt from the levels
+            batch_state,
+        } = self;
+        let levels = levels
+            .values()
+            .map(|level| (level.price.value, level.orders.values().copied().collect()))
+            .collect();
+        (levels, *batch_state as u8)
+    }
+
+    /// Builds a ladder holding `levels` (as [`Self::export_levels`] returned them) and the batch
+    /// state `batch_state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch state code is unknown or set on a non-L1 ladder, a level is
+    /// empty, an order is on another side or at another price than its level, or an order ID is
+    /// repeated.
+    pub(crate) fn from_levels(
+        side: OrderSide,
+        book_type: BookType,
+        levels: Vec<(Price, Vec<BookOrder>)>,
+        batch_state: u8,
+    ) -> anyhow::Result<Self> {
+        let batch_state = match batch_state {
+            0 => L1BatchState::None,
+            1 => L1BatchState::MbpBatch,
+            2 => L1BatchState::SnapshotBatch,
+            code => anyhow::bail!("Invalid L1 batch state code: {code}"),
+        };
+        anyhow::ensure!(
+            book_type == BookType::L1_MBP || batch_state == L1BatchState::None,
+            "Cannot restore an L1 batch state for book type {book_type:?}"
+        );
+        let mut ladder = Self::new(side, book_type);
+        ladder.batch_state = batch_state;
+        for (price, orders) in levels {
+            anyhow::ensure!(!orders.is_empty(), "{side:?} level {price} holds no order");
+            let book_price = BookPrice::new(price, side);
+            let mut level = BookLevel::new(book_price);
+            for order in orders {
+                anyhow::ensure!(
+                    order.side == Some(side) && order.price == price,
+                    "{side:?} level {price} holds order {} at {} on {:?}",
+                    order.order_id,
+                    order.price,
+                    order.side
+                );
+                anyhow::ensure!(
+                    ladder.cache.insert(order.order_id, book_price).is_none(),
+                    "order ID {} is repeated in the {side:?} ladder",
+                    order.order_id
+                );
+                level.orders.insert(order.order_id, order);
+            }
+            anyhow::ensure!(
+                ladder.levels.insert(book_price, level).is_none(),
+                "{side:?} level {price} is repeated"
+            );
+        }
+        Ok(ladder)
+    }
+
     /// Removes all orders and price levels from the ladder.
     ///
     /// Also resets the batch state to ensure clean handling of subsequent batches.

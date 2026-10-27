@@ -89,6 +89,15 @@ impl PositionIdGenerator {
         self.counts.clear();
     }
 
+    /// Returns the count of each strategy that has one, unordered.
+    #[must_use]
+    pub fn counts(&self) -> Vec<(StrategyId, usize)> {
+        self.counts
+            .iter()
+            .map(|(strategy_id, count)| (*strategy_id, *count))
+            .collect()
+    }
+
     #[must_use]
     pub fn count(&self, strategy_id: StrategyId) -> usize {
         *self.counts.get(&strategy_id).unwrap_or(&0)

@@ -39,6 +39,16 @@ use crate::{
     generators::{client_order_id::ClientOrderIdGenerator, order_list_id::OrderListIdGenerator},
 };
 
+/// An [`OrderFactory`]'s counts, for saving a backtest and resuming it. The generators' other
+/// fields format the IDs from the clock and are rebuilt by setup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrderFactoryState {
+    /// Client order IDs generated.
+    pub client_order_id_count: usize,
+    /// Order list IDs generated.
+    pub order_list_id_count: usize,
+}
+
 #[derive(Debug)]
 pub struct OrderFactory {
     clock: Rc<RefCell<dyn Clock>>,
@@ -117,6 +127,32 @@ impl OrderFactory {
     #[must_use]
     pub const fn order_list_id_count(&self) -> usize {
         self.order_list_id_generator.count()
+    }
+
+    /// Returns the factory's counts, for saving a backtest and resuming it.
+    #[must_use]
+    pub fn export_state(&self) -> OrderFactoryState {
+        let Self {
+            clock: _,       // Rebuilt by setup: the strategy's clock
+            trader_id: _,   // Rebuilt by setup
+            strategy_id: _, // Rebuilt by setup
+            order_id_generator,
+            order_list_id_generator,
+        } = self;
+        OrderFactoryState {
+            client_order_id_count: order_id_generator.count(),
+            order_list_id_count: order_list_id_generator.count(),
+        }
+    }
+
+    /// Sets the factory's counts to `state`'s.
+    pub fn import_state(&mut self, state: OrderFactoryState) {
+        let OrderFactoryState {
+            client_order_id_count,
+            order_list_id_count,
+        } = state;
+        self.set_client_order_id_count(client_order_id_count);
+        self.set_order_list_id_count(order_list_id_count);
     }
 
     /// Generates a new client order ID.

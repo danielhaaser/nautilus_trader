@@ -24,4 +24,4 @@ pub use client::{
     ExecutionClientFactoryRegistry, SimulatedExecutionClientFactory,
 };
 pub use event::OrderEventFactory;
-pub use order::OrderFactory;
+pub use order::{OrderFactory, OrderFactoryState};

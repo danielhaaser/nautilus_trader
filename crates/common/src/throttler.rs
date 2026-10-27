@@ -232,6 +232,79 @@ where
     }
 }
 
+/// A [`Throttler`]'s rate window, for saving a backtest and resuming it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThrottlerState {
+    /// The send timestamps held, newest first.
+    pub timestamps: Vec<UnixNanos>,
+    /// Messages received.
+    pub recv_count: usize,
+    /// Messages sent.
+    pub sent_count: usize,
+}
+
+impl<T, F> Throttler<T, F> {
+    /// Returns the throttler's rate window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the throttler is limiting or holds buffered messages: its resume
+    /// timer's callback is a closure a saved backtest cannot carry.
+    pub fn export_state(&self) -> anyhow::Result<ThrottlerState> {
+        let Self {
+            clock: _, // Rebuilt by setup
+            actor_id,
+            timer_name: _,  // Rebuilt by setup
+            limit: _,       // Rebuilt by setup: the config
+            interval_ns: _, // Rebuilt by setup: the config
+            large_limit: _, // Rebuilt by setup: the config
+            buffer,
+            timestamps,
+            is_limiting,
+            recv_count,
+            sent_count,
+            output_send: _, // Rebuilt by setup
+            output_drop: _, // Rebuilt by setup
+        } = self;
+        anyhow::ensure!(
+            !*is_limiting && buffer.is_empty(),
+            "throttler {actor_id} is limiting with {} message(s) buffered",
+            buffer.len()
+        );
+        Ok(ThrottlerState {
+            timestamps: timestamps.iter().copied().collect(),
+            recv_count: *recv_count,
+            sent_count: *sent_count,
+        })
+    }
+
+    /// Replaces the throttler's rate window with `state`'s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `state` holds more timestamps than the limit.
+    pub fn import_state(&mut self, state: ThrottlerState) -> anyhow::Result<()> {
+        let ThrottlerState {
+            timestamps,
+            recv_count,
+            sent_count,
+        } = state;
+        anyhow::ensure!(
+            timestamps.len() <= self.limit.get(),
+            "throttler {} holds {} timestamps over its limit {}",
+            self.actor_id,
+            timestamps.len(),
+            self.limit
+        );
+        self.buffer.clear();
+        self.is_limiting = false;
+        self.timestamps = timestamps.into_iter().collect();
+        self.recv_count = recv_count;
+        self.sent_count = sent_count;
+        Ok(())
+    }
+}
+
 impl<T, F> Throttler<T, F> {
     /// Cancels the throttler's timer if one is pending. Silently does nothing
     /// when the clock is borrowed elsewhere or no timer exists (best-effort,

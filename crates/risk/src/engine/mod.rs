@@ -16,6 +16,7 @@
 //! Risk management engine implementation.
 
 pub mod config;
+pub mod state;
 
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 

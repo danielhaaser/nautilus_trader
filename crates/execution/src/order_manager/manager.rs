@@ -45,6 +45,53 @@ pub struct OrderManager {
     oto_target_quantities: AHashMap<ClientOrderId, Quantity>,
 }
 
+/// An [`OrderManager`]'s replay state, for saving a backtest and resuming it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrderManagerState {
+    /// The submit commands held for contingent orders, sorted by client order ID.
+    pub submit_order_commands: Vec<(ClientOrderId, SubmitOrder)>,
+    /// The OTO target quantities, sorted by client order ID.
+    pub oto_target_quantities: Vec<(ClientOrderId, Quantity)>,
+}
+
+impl OrderManager {
+    /// Returns the manager's replay state.
+    #[must_use]
+    pub fn export_state(&self) -> OrderManagerState {
+        let Self {
+            clock: _,        // Rebuilt by setup: the strategy's clock
+            cache: _,        // Rebuilt by setup: the kernel's cache
+            active_local: _, // Rebuilt by setup
+            submit_order_commands,
+            oto_target_quantities,
+        } = self;
+        let mut submit_order_commands: Vec<(ClientOrderId, SubmitOrder)> = submit_order_commands
+            .iter()
+            .map(|(client_order_id, command)| (*client_order_id, command.clone()))
+            .collect();
+        submit_order_commands.sort_unstable_by_key(|(client_order_id, _)| *client_order_id);
+        let mut oto_target_quantities: Vec<(ClientOrderId, Quantity)> = oto_target_quantities
+            .iter()
+            .map(|(client_order_id, quantity)| (*client_order_id, *quantity))
+            .collect();
+        oto_target_quantities.sort_unstable_by_key(|(client_order_id, _)| *client_order_id);
+        OrderManagerState {
+            submit_order_commands,
+            oto_target_quantities,
+        }
+    }
+
+    /// Overwrites the manager's replay state with `state`.
+    pub fn import_state(&mut self, state: OrderManagerState) {
+        let OrderManagerState {
+            submit_order_commands,
+            oto_target_quantities,
+        } = state;
+        self.submit_order_commands = submit_order_commands.into_iter().collect();
+        self.oto_target_quantities = oto_target_quantities.into_iter().collect();
+    }
+}
+
 impl Debug for OrderManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(OrderManager))

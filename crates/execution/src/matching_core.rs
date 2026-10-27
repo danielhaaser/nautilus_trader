@@ -596,7 +596,7 @@ impl OrderMatchingCore {
 }
 
 /// Lightweight order information for matching/trigger checking.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RestingOrder {
     pub client_order_id: ClientOrderId,
     pub order_side: OrderSide,
@@ -708,6 +708,88 @@ impl From<&PassiveOrderAny> for RestingOrder {
                 }
             }
         }
+    }
+}
+
+/// An [`OrderMatchingCore`]'s complete state as plain data, for saving a backtest and resuming
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrderMatchingCoreState {
+    /// The current bid price.
+    pub bid: Option<Price>,
+    /// The current ask price.
+    pub ask: Option<Price>,
+    /// The last price.
+    pub last: Option<Price>,
+    /// Whether limit orders at or inside the spread are fillable.
+    pub fill_limit_inside_spread: bool,
+    /// Every resting order: the bid limits, ask limits, bid stops and ask stops, each book in
+    /// price order and each price in time priority, then the pending bids and asks.
+    pub orders: Vec<RestingOrder>,
+}
+
+impl OrderMatchingCore {
+    /// Returns the core's complete state.
+    #[must_use]
+    pub fn export_state(&self) -> OrderMatchingCoreState {
+        let Self {
+            instrument_id: _,   // Rebuilt by setup: the engine's instrument
+            price_increment: _, // Rebuilt by setup: the engine's instrument
+            bid,
+            ask,
+            last,
+            fill_limit_inside_spread,
+            bid_limits,
+            ask_limits,
+            bid_stops,
+            ask_stops,
+            pending_bid,
+            pending_ask,
+            order_index: _, // Derived: rebuilt as each order is added back
+        } = self;
+        let orders = [bid_limits, ask_limits, bid_stops, ask_stops]
+            .into_iter()
+            .flat_map(|book| book.values().flatten())
+            .chain(pending_bid.iter())
+            .chain(pending_ask.iter())
+            .copied()
+            .collect();
+        OrderMatchingCoreState {
+            bid: *bid,
+            ask: *ask,
+            last: *last,
+            fill_limit_inside_spread: *fill_limit_inside_spread,
+            orders,
+        }
+    }
+
+    /// Replaces the core's prices and orders with `state`'s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an order is listed twice.
+    pub fn import_state(&mut self, state: OrderMatchingCoreState) -> anyhow::Result<()> {
+        let OrderMatchingCoreState {
+            bid,
+            ask,
+            last,
+            fill_limit_inside_spread,
+            orders,
+        } = state;
+        self.reset();
+        self.bid = bid;
+        self.ask = ask;
+        self.last = last;
+        self.fill_limit_inside_spread = fill_limit_inside_spread;
+        for order in orders {
+            anyhow::ensure!(
+                !self.order_exists(order.client_order_id),
+                "resting order {} is listed twice",
+                order.client_order_id
+            );
+            self.add_order(order);
+        }
+        Ok(())
     }
 }
 

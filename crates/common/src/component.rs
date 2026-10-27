@@ -583,6 +583,40 @@ pub fn start_component(id: &Ustr) -> anyhow::Result<()> {
     }
 }
 
+/// Moves a component in the global registry to running without calling its `on_start`: the
+/// start of a backtest resumed from a saved state, where the component already started in the
+/// run that saved it.
+///
+/// # Errors
+///
+/// Returns an error if the component is not found, is already borrowed, or cannot start from
+/// its current state.
+pub fn start_component_restored(id: &Ustr) -> anyhow::Result<()> {
+    let component_ref = with_component_registry(|registry| {
+        let component_ref = registry
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Component '{id}' not found in global registry"))?;
+
+        if !registry.try_borrow(*id) {
+            anyhow::bail!(
+                "Component '{id}' is already mutably borrowed. \
+                 This would create aliasing mutable references (undefined behavior)."
+            );
+        }
+
+        Ok::<_, anyhow::Error>(component_ref)
+    })?;
+
+    let _guard = BorrowGuard::new(*id);
+
+    // SAFETY: Borrow tracking ensures exclusive access
+    unsafe {
+        let component = &mut *component_ref.get();
+        component.transition_state(ComponentTrigger::Start)?;
+        component.transition_state(ComponentTrigger::StartCompleted)
+    }
+}
+
 /// Returns the state of a component in the global registry.
 ///
 /// # Errors

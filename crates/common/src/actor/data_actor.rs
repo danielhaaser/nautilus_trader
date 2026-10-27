@@ -3166,6 +3166,293 @@ struct Subscription<T> {
     command: Option<DataCommand>,
 }
 
+/// One data subscription of a [`DataActorState`]: its topic and the command that made it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionState {
+    /// The topic or pattern subscribed to.
+    pub topic: String,
+    /// The subscription's command.
+    pub command: SubscribeCommand,
+}
+
+/// A [`DataActorCore`]'s replay state, for saving a backtest and resuming it: the data
+/// subscriptions to issue again (the handlers are closures over the actor's type, so a resume
+/// subscribes again through [`resubscribe`] rather than restoring them) and the plain records.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DataActorState {
+    /// The subscriptions, by kind then topic.
+    pub subscriptions: Vec<SubscriptionState>,
+    /// The warnings logged once, sorted.
+    pub warning_events: Vec<String>,
+    /// The signal classes, sorted by name.
+    pub signal_classes: Vec<(String, String)>,
+}
+
+/// Appends each of `handlers`' subscriptions to `out`, by topic.
+fn collect_subscriptions<K: std::fmt::Display, H>(
+    actor_id: &ActorId,
+    handlers: &AHashMap<K, Subscription<H>>,
+    out: &mut Vec<SubscriptionState>,
+) -> anyhow::Result<()> {
+    let mut entries: Vec<(String, &Subscription<H>)> = handlers
+        .iter()
+        .map(|(key, subscription)| (key.to_string(), subscription))
+        .collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    for (key, subscription) in entries {
+        match &subscription.command {
+            Some(DataCommand::Subscribe(command)) => out.push(SubscriptionState {
+                topic: key,
+                command: command.clone(),
+            }),
+            _ => anyhow::bail!(
+                "actor {actor_id} subscribes to {key} without a data subscription, which \
+                 a saved backtest cannot issue again"
+            ),
+        }
+    }
+    Ok(())
+}
+
+impl DataActorCore {
+    /// Returns the actor's replay state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor holds what a saved backtest cannot carry: a subscription
+    /// made without a data command (signals, queue or socket state, a direct topic), an option
+    /// chain subscription, a pending request, or a registered indicator.
+    pub fn export_state(&self) -> anyhow::Result<DataActorState> {
+        let Self {
+            actor_id,
+            config: _,    // Rebuilt by setup
+            trader_id: _, // Rebuilt by setup: registration
+            clock: _,     // Rebuilt by setup: registration
+            cache: _,     // Rebuilt by setup: registration
+            state: _,     // Set by the resume's start
+            topic_handlers,
+            instrument_handlers,
+            deltas_handlers,
+            depth_handlers,
+            book_handlers,
+            quote_handlers,
+            trade_handlers,
+            bar_handlers,
+            mark_price_handlers,
+            index_price_handlers,
+            funding_rate_handlers,
+            option_greeks_handlers,
+            option_chain_handlers,
+            indicators,
+            warning_events,
+            pending_requests,
+            signal_classes,
+            #[cfg(feature = "defi")]
+            block_handlers,
+            #[cfg(feature = "defi")]
+            pool_handlers,
+            #[cfg(feature = "defi")]
+            pool_swap_handlers,
+            #[cfg(feature = "defi")]
+            pool_liquidity_handlers,
+            #[cfg(feature = "defi")]
+            pool_collect_handlers,
+            #[cfg(feature = "defi")]
+            pool_flash_handlers,
+            #[cfg(feature = "python")]
+                message_bus: _, // Rebuilt by setup
+        } = self;
+        anyhow::ensure!(
+            pending_requests.is_empty(),
+            "actor {actor_id} has {} pending data request(s)",
+            pending_requests.len()
+        );
+        anyhow::ensure!(
+            indicators.registered_indicators().is_empty(),
+            "actor {actor_id} has registered indicators, which a saved backtest cannot carry"
+        );
+        anyhow::ensure!(
+            option_chain_handlers.is_empty(),
+            "actor {actor_id} subscribes to option chains, which a saved backtest cannot carry"
+        );
+        #[cfg(feature = "defi")]
+        anyhow::ensure!(
+            block_handlers.is_empty()
+                && pool_handlers.is_empty()
+                && pool_swap_handlers.is_empty()
+                && pool_liquidity_handlers.is_empty()
+                && pool_collect_handlers.is_empty()
+                && pool_flash_handlers.is_empty(),
+            "actor {actor_id} subscribes to DeFi data, which a saved backtest cannot carry"
+        );
+
+        let mut subscriptions = Vec::new();
+        collect_subscriptions(actor_id, topic_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, instrument_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, deltas_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, depth_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, book_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, quote_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, trade_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, bar_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, mark_price_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, index_price_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, funding_rate_handlers, &mut subscriptions)?;
+        collect_subscriptions(actor_id, option_greeks_handlers, &mut subscriptions)?;
+
+        let mut warning_events: Vec<String> = warning_events.iter().cloned().collect();
+        warning_events.sort_unstable();
+        let mut signal_classes: Vec<(String, String)> = signal_classes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        signal_classes.sort_unstable();
+        Ok(DataActorState {
+            subscriptions,
+            warning_events,
+            signal_classes,
+        })
+    }
+}
+
+/// Issues each of `state`'s subscriptions again through `actor`'s own subscribe methods (so the
+/// handlers are the ones a subscription made in the replay would have), and restores its plain
+/// records. The actor must be registered and hold no subscription yet.
+///
+/// # Errors
+///
+/// Returns an error if `state` holds an option chain subscription.
+pub fn resubscribe<T>(actor: &mut T, state: DataActorState) -> anyhow::Result<()>
+where
+    T: DataActor + DataActorNative + 'static + Debug,
+{
+    let DataActorState {
+        subscriptions,
+        warning_events,
+        signal_classes,
+    } = state;
+    for SubscriptionState { command, .. } in subscriptions.iter().cloned() {
+        match command {
+            SubscribeCommand::Data(cmd) => {
+                actor.subscribe_data(cmd.data_type, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::Instrument(cmd) => {
+                actor.subscribe_instrument(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::Instruments(cmd) => {
+                actor.subscribe_instruments(cmd.venue, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::BookDeltas(cmd) => actor.subscribe_book_deltas(
+                cmd.instrument_id,
+                cmd.book_type,
+                cmd.depth,
+                cmd.client_id,
+                cmd.managed,
+                cmd.params,
+            ),
+            SubscribeCommand::BookDepth(cmd) => actor.subscribe_book_depth(
+                cmd.instrument_id,
+                cmd.book_type,
+                cmd.depth,
+                cmd.client_id,
+                cmd.managed,
+                cmd.params,
+            ),
+            SubscribeCommand::BookSnapshots(cmd) => actor.subscribe_book_at_interval(
+                cmd.instrument_id,
+                cmd.book_type,
+                cmd.depth,
+                cmd.interval_ms,
+                cmd.client_id,
+                cmd.params,
+            ),
+            SubscribeCommand::Quotes(cmd) => {
+                actor.subscribe_quotes(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::Trades(cmd) => {
+                actor.subscribe_trades(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::Bars(cmd) => {
+                actor.subscribe_bars(cmd.bar_type, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::MarkPrices(cmd) => {
+                actor.subscribe_mark_prices(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::IndexPrices(cmd) => {
+                actor.subscribe_index_prices(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::FundingRates(cmd) => {
+                actor.subscribe_funding_rates(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::InstrumentStatus(cmd) => {
+                actor.subscribe_instrument_status(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::InstrumentClose(cmd) => {
+                actor.subscribe_instrument_close(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::OptionGreeks(cmd) => {
+                actor.subscribe_option_greeks(cmd.instrument_id, cmd.client_id, cmd.params);
+            }
+            SubscribeCommand::OptionChain(cmd) => anyhow::bail!(
+                "option chain subscription {} cannot be issued again",
+                cmd.series_id
+            ),
+        }
+    }
+    let core = actor.core_mut();
+    core.restore_subscription_commands(subscriptions)?;
+    core.warning_events = warning_events.into_iter().collect();
+    core.signal_classes = signal_classes.into_iter().collect();
+    Ok(())
+}
+
+impl DataActorCore {
+    /// Puts each saved subscription's own command back in place of the one issuing it again
+    /// made (a new command ID and instant), so the actor is as it was saved.
+    fn restore_subscription_commands(
+        &mut self,
+        subscriptions: Vec<SubscriptionState>,
+    ) -> anyhow::Result<()> {
+        fn restore<K: std::fmt::Display, H>(
+            handlers: &mut AHashMap<K, Subscription<H>>,
+            topic: &str,
+            command: &SubscribeCommand,
+        ) -> bool {
+            for (key, subscription) in handlers.iter_mut() {
+                if key.to_string() == topic
+                    && matches!(&subscription.command, Some(DataCommand::Subscribe(made))
+                        if std::mem::discriminant(made) == std::mem::discriminant(command))
+                {
+                    subscription.command = Some(DataCommand::Subscribe(command.clone()));
+                    return true;
+                }
+            }
+            false
+        }
+
+        for SubscriptionState { topic, command } in subscriptions {
+            let restored = restore(&mut self.topic_handlers, &topic, &command)
+                || restore(&mut self.instrument_handlers, &topic, &command)
+                || restore(&mut self.deltas_handlers, &topic, &command)
+                || restore(&mut self.depth_handlers, &topic, &command)
+                || restore(&mut self.book_handlers, &topic, &command)
+                || restore(&mut self.quote_handlers, &topic, &command)
+                || restore(&mut self.trade_handlers, &topic, &command)
+                || restore(&mut self.bar_handlers, &topic, &command)
+                || restore(&mut self.mark_price_handlers, &topic, &command)
+                || restore(&mut self.index_price_handlers, &topic, &command)
+                || restore(&mut self.funding_rate_handlers, &topic, &command)
+                || restore(&mut self.option_greeks_handlers, &topic, &command);
+            anyhow::ensure!(
+                restored,
+                "actor {}: subscribing again to {topic} made no subscription there",
+                self.actor_id
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Debug for DataActorCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(DataActorCore))

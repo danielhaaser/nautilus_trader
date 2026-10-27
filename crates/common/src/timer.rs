@@ -492,6 +492,96 @@ impl VirtualTimer {
     }
 }
 
+/// A [`VirtualTimer`]'s complete state as plain data, for saving a backtest and resuming it.
+///
+/// Only a fixed-interval timer has one: a [`TimerSchedule`] is an object a resume would rebuild,
+/// so [`VirtualTimer::export_state`] refuses a scheduled timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VirtualTimerState {
+    /// The name of the timer.
+    pub name: Ustr,
+    /// The fixed interval in nanoseconds.
+    pub interval_ns: u64,
+    /// The start time of the timer.
+    pub start_time_ns: UnixNanos,
+    /// The optional inclusive stop time of the timer.
+    pub stop_time_ns: Option<UnixNanos>,
+    /// Whether the first event fired at the start time.
+    pub fire_immediately: bool,
+    /// The next time the timer fires.
+    pub next_time_ns: UnixNanos,
+    /// The occurrence index of the next event.
+    pub next_index: u64,
+    /// Whether the timer is expired.
+    pub is_expired: bool,
+}
+
+impl VirtualTimer {
+    /// Returns the timer's complete state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timer runs on a [`TimerSchedule`].
+    pub fn export_state(&self) -> anyhow::Result<VirtualTimerState> {
+        let Self {
+            name,
+            interval,
+            start_time_ns,
+            stop_time_ns,
+            fire_immediately,
+            next_time_ns,
+            next_index,
+            is_expired,
+        } = self;
+        let interval_ns = match interval {
+            TimerInterval::Fixed(interval_ns) => interval_ns.get(),
+            TimerInterval::Schedule(_) => {
+                anyhow::bail!("timer {name} runs on a schedule, which cannot be saved")
+            }
+        };
+        Ok(VirtualTimerState {
+            name: *name,
+            interval_ns,
+            start_time_ns: *start_time_ns,
+            stop_time_ns: *stop_time_ns,
+            fire_immediately: *fire_immediately,
+            next_time_ns: *next_time_ns,
+            next_index: *next_index,
+            is_expired: *is_expired,
+        })
+    }
+
+    /// Builds the timer `state` describes, at the event it was going to fire next.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the interval is zero.
+    pub fn from_state(state: VirtualTimerState) -> anyhow::Result<Self> {
+        let VirtualTimerState {
+            name,
+            interval_ns,
+            start_time_ns,
+            stop_time_ns,
+            fire_immediately,
+            next_time_ns,
+            next_index,
+            is_expired,
+        } = state;
+        let interval = NonZeroU64::new(interval_ns)
+            .ok_or_else(|| anyhow::anyhow!("timer {name} has a zero interval"))?;
+        Ok(Self {
+            name,
+            interval: TimerInterval::Fixed(interval),
+            start_time_ns,
+            stop_time_ns,
+            fire_immediately,
+            next_time_ns,
+            next_index,
+            is_expired,
+        })
+    }
+}
+
 impl Timer for VirtualTimer {
     fn is_expired(&self) -> bool {
         Self::is_expired(self)

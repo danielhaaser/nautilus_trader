@@ -45,6 +45,7 @@ nautilus-model = { workspace = true }
 nautilus-portfolio = { workspace = true }
 
 ahash = { workspace = true }
+anyhow = { workspace = true }
 bon = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }

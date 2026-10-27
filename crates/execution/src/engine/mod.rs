@@ -23,6 +23,7 @@
 pub mod config;
 pub mod position;
 pub mod settlement;
+pub mod state;
 pub mod stubs;
 
 use std::{

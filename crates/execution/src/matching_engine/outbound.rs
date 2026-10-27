@@ -149,6 +149,60 @@ impl OutboundEvents {
     }
 }
 
+/// An [`OutboundEvents`]'s held events, for saving a backtest and resuming it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutboundEventsState {
+    /// The held events in release then admission order, each with its release instant and
+    /// admission sequence.
+    pub events: Vec<(UnixNanos, u64, OrderEventAny)>,
+    /// The next admission sequence.
+    pub next_seq: u64,
+    /// The latest release instant held for each order, by client order ID.
+    pub order_release: Vec<(ClientOrderId, UnixNanos)>,
+}
+
+impl OutboundEvents {
+    /// Returns the held events.
+    #[must_use]
+    pub fn export_state(&self) -> OutboundEventsState {
+        let queue = self.queue.borrow();
+        let Queue {
+            events,
+            next_seq,
+            order_release,
+        } = &*queue;
+        let mut order_release: Vec<(ClientOrderId, UnixNanos)> = order_release
+            .iter()
+            .map(|(client_order_id, release)| (*client_order_id, *release))
+            .collect();
+        order_release.sort_unstable();
+        OutboundEventsState {
+            events: events
+                .iter()
+                .map(|((release, seq), event)| (*release, *seq, event.clone()))
+                .collect(),
+            next_seq: *next_seq,
+            order_release,
+        }
+    }
+
+    /// Replaces the held events with `state`'s.
+    pub fn import_state(&self, state: OutboundEventsState) {
+        let OutboundEventsState {
+            events,
+            next_seq,
+            order_release,
+        } = state;
+        let mut queue = self.queue.borrow_mut();
+        queue.events = events
+            .into_iter()
+            .map(|(release, seq, event)| ((release, seq), event))
+            .collect();
+        queue.next_seq = next_seq;
+        queue.order_release = order_release.into_iter().collect();
+    }
+}
+
 /// Returns an event handler that admits each event into `outbound` with the latency `model`
 /// gives it at the instant `clock` reads: an event to deliver at once goes to `deliver`, and the
 /// release instant of each held event goes to `on_held`, so the venue can wake to release it.

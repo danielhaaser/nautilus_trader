@@ -41,7 +41,10 @@ mod storage;
 pub(crate) mod tests;
 
 // Re-exports
-pub use data_actor::{DataActor, DataActorConfig, DataActorCore, DataActorNative};
+pub use data_actor::{
+    DataActor, DataActorConfig, DataActorCore, DataActorNative, DataActorState, SubscriptionState,
+    resubscribe,
+};
 #[doc(hidden)]
 pub use dispatch::DispatchError as CallbackDispatchError;
 pub(crate) use dispatch::{ChainContext, PublicationScope};
@@ -74,6 +77,13 @@ pub fn drain_callbacks(budget: usize) -> Result<bool, CallbackDispatchError> {
 #[must_use]
 pub fn callback_failure() -> Option<CallbackDispatchError> {
     dispatch::failure()
+}
+
+/// Returns whether callback slots are queued for delivery on this thread.
+#[doc(hidden)]
+#[must_use]
+pub fn callbacks_pending() -> bool {
+    dispatch::has_pending()
 }
 
 /// Releases queued callback captures and resets dispatch accounting at a safe boundary.

@@ -31,6 +31,7 @@
 pub mod bar;
 pub mod book;
 pub mod config;
+pub mod state;
 
 #[cfg(feature = "defi")]
 pub mod pool;

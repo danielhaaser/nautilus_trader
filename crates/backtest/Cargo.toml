@@ -105,6 +105,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true, features = ["examples"] }
 
 criterion = { workspace = true }
+rmp-serde = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }

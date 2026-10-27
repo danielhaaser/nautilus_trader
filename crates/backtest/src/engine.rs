@@ -81,6 +81,8 @@ use crate::{
     },
 };
 
+pub mod state;
+
 const CALLBACK_DRAIN_BUDGET: usize = 1024;
 
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
@@ -127,6 +129,11 @@ pub struct BacktestEngine {
     /// Settle every timestamp as the pin did, without the checks that skip work nothing is due
     /// for (`set_reference_settlement`): the reference the skipping settlement is tested against.
     reference_settlement: bool,
+    /// The instrument expiration alerts armed once the replay started: a saved state carries
+    /// these, as setup arms the others again.
+    expiration_alerts_armed: AHashSet<ustr::Ustr>,
+    /// The instrument expiration alerts cancelled once the replay started.
+    expiration_alerts_cancelled: AHashSet<ustr::Ustr>,
 }
 
 impl Debug for BacktestEngine {
@@ -197,6 +204,8 @@ impl BacktestEngine {
             backtest_end: None,
             funding_error: None,
             reference_settlement: false,
+            expiration_alerts_armed: AHashSet::new(),
+            expiration_alerts_cancelled: AHashSet::new(),
         })
     }
 
@@ -396,6 +405,12 @@ impl BacktestEngine {
             exchange.borrow_mut().add_instrument(instrument.clone())?;
             if let Some(expiration_ns) = instrument.expiration_ns() {
                 self.set_instrument_expiration_timer(exchange, instrument_id, expiration_ns)?;
+                if self.run_started.is_some() && expiration_ns != UnixNanos::default() {
+                    self.expiration_alerts_armed.insert(ustr::Ustr::from(
+                        Self::instrument_expiration_timer_name(instrument_id.venue, expiration_ns)
+                            .as_str(),
+                    ));
+                }
             }
 
             if let Some(previous_expiration_ns) = previous_expiration_ns
@@ -409,6 +424,10 @@ impl BacktestEngine {
                     previous_expiration_ns,
                 );
                 self.kernel.clock.borrow_mut().cancel_timer(&timer_name);
+                if self.run_started.is_some() {
+                    self.expiration_alerts_cancelled
+                        .insert(ustr::Ustr::from(timer_name.as_str()));
+                }
             }
         } else {
             anyhow::bail!(
@@ -869,6 +888,12 @@ impl BacktestEngine {
 
         // First-iteration initialization
         if self.iteration == 0 {
+            // Setup is complete: a saved state names what the replay changes from here
+            for exchange in self.venues.values() {
+                exchange.borrow_mut().mark_setup_complete();
+            }
+            self.kernel.cache.borrow_mut().track_instrument_changes();
+
             self.set_instrument_expiration_timers()?;
 
             self.run_config_id = run_config_id;
@@ -1310,6 +1335,8 @@ impl BacktestEngine {
 
         self.accumulator.clear();
         self.cancel_funding_settlement_timers();
+        self.expiration_alerts_armed.clear();
+        self.expiration_alerts_cancelled.clear();
 
         // Reset all iterator cursors to beginning (data persists)
         self.data_iterator.reset_all_cursors();
@@ -2138,6 +2165,19 @@ impl BacktestEngine {
             return Ok(());
         }
 
+        let callback = Self::instrument_expiration_callback(exchange);
+        let mut clock = self.kernel.clock.borrow_mut();
+
+        clock.set_time_alert_ns(&timer_name, expiration_ns, Some(callback), None)?;
+
+        Ok(())
+    }
+
+    /// The callback of a venue's instrument expiration alerts: processes the venue's expirations
+    /// due at the alert's instant.
+    fn instrument_expiration_callback(
+        exchange: &Rc<RefCell<SimulatedExchange>>,
+    ) -> TimeEventCallback {
         let exchange: Weak<RefCell<SimulatedExchange>> = Rc::downgrade(exchange);
         let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |event: TimeEvent| {
             if let Some(exchange) = exchange.upgrade() {
@@ -2146,16 +2186,7 @@ impl BacktestEngine {
                     .process_instrument_expirations(event.ts_event);
             }
         });
-        let mut clock = self.kernel.clock.borrow_mut();
-
-        clock.set_time_alert_ns(
-            &timer_name,
-            expiration_ns,
-            Some(TimeEventCallback::from(callback)),
-            None,
-        )?;
-
-        Ok(())
+        TimeEventCallback::from(callback)
     }
 
     fn instrument_expiration_timer_name(venue: Venue, expiration_ns: UnixNanos) -> String {
