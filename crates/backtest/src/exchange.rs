@@ -350,6 +350,7 @@ pub struct SimulatedExchange {
     frozen_account: bool,
     queue_position: bool,
     book_cross_fills: bool,
+    l1_market_remainder_slips: bool,
     oto_full_trigger: bool,
     defer_option_settlement: bool,
     price_protection_points: u32,
@@ -674,6 +675,7 @@ impl SimulatedExchange {
             frozen_account: config.frozen_account,
             queue_position: config.queue_position,
             book_cross_fills: config.book_cross_fills,
+            l1_market_remainder_slips: config.l1_market_remainder_slips,
             oto_full_trigger: config.oto_full_trigger,
             defer_option_settlement: config.defer_option_settlement,
             price_protection_points: config.price_protection_points,
@@ -996,6 +998,7 @@ impl SimulatedExchange {
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
             .book_cross_fills(self.book_cross_fills)
+            .l1_market_remainder_slips(self.l1_market_remainder_slips)
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)

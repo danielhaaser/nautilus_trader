@@ -20102,6 +20102,74 @@ fn test_l1_ioc_market_order_cancels_remainder_instead_of_slipping(
     assert_eq!(canceled.client_order_id, market_order.client_order_id());
 }
 
+// With the switch off a GTC market order's remainder past the one L1 level is cancelled, as an
+// IOC order's is; on (the default) it slips one tick
+#[rstest]
+#[case::buy_slips(OrderSide::Buy, true, true, ("1010.00", Some("1010.01")))]
+#[case::sell_slips(OrderSide::Sell, true, true, ("1000.00", Some("999.99")))]
+#[case::buy_cancels(OrderSide::Buy, false, true, ("1010.00", None))]
+#[case::sell_cancels(OrderSide::Sell, false, true, ("1000.00", None))]
+#[case::initialized_buy_cancels(OrderSide::Buy, false, false, ("1010.00", None))]
+fn test_l1_market_remainder_slips_switch_cancels_the_remainder_past_the_level(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] side: OrderSide,
+    #[case] l1_market_remainder_slips: bool,
+    #[case] submitted: bool,
+    #[case] expected_px: (&str, Option<&str>),
+) {
+    let (top_of_book_px, slip_px) = expected_px;
+    let config = OrderMatchingEngineConfig {
+        l1_market_remainder_slips,
+        ..Default::default()
+    };
+    let mut engine =
+        get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, Some(config));
+
+    let quote = QuoteTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("1000.00"),
+        Price::from("1010.00"),
+        Quantity::from("0.500"),
+        Quantity::from("0.500"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    engine.process_quote_tick(&quote);
+
+    let mut builder = OrderTestBuilder::new(OrderType::Market);
+    builder
+        .instrument_id(instrument_eth_usdt.id())
+        .side(side)
+        .quantity(Quantity::from("1.500"))
+        .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"));
+    if submitted {
+        builder.submit(true);
+    }
+    let mut market_order = builder.build();
+    assert_eq!(market_order.time_in_force(), TimeInForce::Gtc);
+    engine.process_order(&mut market_order, account_id);
+
+    let saved_messages = get_order_event_handler_messages(&order_event_handler);
+    let OrderEventAny::Filled(fill) = &saved_messages[0] else {
+        panic!("Expected OrderFilled, was {:?}", saved_messages[0]);
+    };
+    assert_eq!(fill.last_px, Price::from(top_of_book_px));
+    assert_eq!(fill.last_qty, Quantity::from("0.500"));
+    assert_eq!(saved_messages.len(), 2);
+    match (slip_px, &saved_messages[1]) {
+        (Some(slip_px), OrderEventAny::Filled(slipped)) => {
+            assert_eq!(slipped.last_px, Price::from(slip_px));
+            assert_eq!(slipped.last_qty, Quantity::from("1.000"));
+        }
+        (None, OrderEventAny::Canceled(canceled)) => {
+            assert_eq!(canceled.client_order_id, market_order.client_order_id());
+        }
+        (_, other) => panic!("Unexpected second event {other:?} for slip_px {slip_px:?}"),
+    }
+}
+
 fn apply_released_status(order: &mut OrderAny, released_price: Price) {
     let trader_id = order.trader_id();
     let strategy_id = order.strategy_id();

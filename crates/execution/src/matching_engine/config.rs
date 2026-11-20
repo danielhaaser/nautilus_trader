@@ -58,6 +58,12 @@ pub struct OrderMatchingEngineConfig {
     /// order) are unaffected.
     #[builder(default = true)]
     pub book_cross_fills: bool,
+    /// If the part of a market, market-if-touched, stop-market or trailing-stop-market order that
+    /// an `L1_MBP` book's one level could not fill slips one price increment and fills there.
+    /// When `false`, that remainder is cancelled, as an `IOC` order's is, so the order fills at
+    /// most the level's size. Other book types and order types are unaffected.
+    #[builder(default = true)]
+    pub l1_market_remainder_slips: bool,
     /// How far back, on the venue's clock, a trade reaches for the book deltas that reflect it.
     ///
     /// A venue can publish a trade and the delta that removes its size from the book on channels
@@ -99,6 +105,7 @@ mod tests {
         assert!(!config.bar_adaptive_high_low_ordering);
         assert!(config.trade_execution);
         assert!(config.book_cross_fills);
+        assert!(config.l1_market_remainder_slips);
         assert!(!config.liquidity_consumption);
         assert!(config.reject_stop_orders);
         assert!(config.support_gtd_orders);

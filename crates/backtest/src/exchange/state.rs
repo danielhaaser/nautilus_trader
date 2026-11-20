@@ -287,6 +287,7 @@ impl SimulatedExchange {
             frozen_account: _, // Rebuilt by setup: the venue's config
             queue_position: _, // Rebuilt by setup: the venue's config
             book_cross_fills: _, // Rebuilt by setup: the venue's config
+            l1_market_remainder_slips: _, // Rebuilt by setup: the venue's config
             oto_full_trigger: _, // Rebuilt by setup: the venue's config
             defer_option_settlement: _, // Rebuilt by setup: the venue's config
             price_protection_points: _, // Rebuilt by setup: the venue's config

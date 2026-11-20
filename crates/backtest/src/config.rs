@@ -351,6 +351,11 @@ pub struct SimulatedVenueConfig {
     /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
     #[builder(default = true)]
     pub book_cross_fills: bool,
+    /// If the part of a market-type order an `L1_MBP` book's one level could not fill slips one
+    /// price increment; when `false` it is cancelled
+    /// (`OrderMatchingEngineConfig::l1_market_remainder_slips`).
+    #[builder(default = true)]
+    pub l1_market_remainder_slips: bool,
     /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,
@@ -518,6 +523,11 @@ pub struct BacktestVenueConfig {
     /// fill resting orders (`OrderMatchingEngineConfig::book_cross_fills`).
     #[builder(default = true)]
     book_cross_fills: bool,
+    /// If the part of a market-type order an `L1_MBP` book's one level could not fill slips one
+    /// price increment; when `false` it is cancelled
+    /// (`OrderMatchingEngineConfig::l1_market_remainder_slips`).
+    #[builder(default = true)]
+    l1_market_remainder_slips: bool,
     /// When OTO child orders are released relative to parent fills.
     #[builder(default)]
     oto_trigger_mode: OtoTriggerMode,
@@ -736,6 +746,11 @@ impl BacktestVenueConfig {
     #[must_use]
     pub fn book_cross_fills(&self) -> bool {
         self.book_cross_fills
+    }
+
+    #[must_use]
+    pub fn l1_market_remainder_slips(&self) -> bool {
+        self.l1_market_remainder_slips
     }
 
     #[must_use]

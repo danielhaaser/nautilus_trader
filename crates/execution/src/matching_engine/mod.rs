@@ -5860,6 +5860,13 @@ impl OrderMatchingEngine {
                     | OrderType::TrailingStopMarket
             )
         {
+            // Exhausted L1 volume: with `l1_market_remainder_slips` off, the remainder is
+            // cancelled as an IOC order's is, so the order fills at most the level's size
+            if !self.config.l1_market_remainder_slips {
+                self.cancel_order(order, None);
+                return Ok(());
+            }
+
             // Exhausted L1 volume: slip remainder by a single price increment
             let Some(last_fill_px) = last_fill_px else {
                 return Ok(());
